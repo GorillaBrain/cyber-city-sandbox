@@ -42,70 +42,70 @@ const CORE_TEN_BLUEPRINT = [
     slotId: 'BLD-RES-01',
     name: 'Kowloon Hab-Block 01',
     archetype: 'residential',
-    coords: [-6.2, -5.8],
+    coords: [-3.8, 5.2],
     defaultVulns: ['SIM-VULN-001', 'SIM-VULN-002'],
   },
   {
     slotId: 'BLD-PUB-01',
     name: 'SkyLine Mag-Transit Hub',
     archetype: 'transport',
-    coords: [-1.8, -6.2],
+    coords: [-6.8, 4.4],
     defaultVulns: ['SIM-VULN-010', 'SIM-VULN-002'],
   },
   {
     slotId: 'BLD-GOV-01',
     name: 'Civic Net Command Plaza',
     archetype: 'government',
-    coords: [3.2, -6.0],
+    coords: [3.4, -5.2],
     defaultVulns: ['SIM-VULN-010', 'SIM-VULN-009'],
   },
   {
     slotId: 'BLD-CORP-01',
     name: 'Vectra Corp Tower',
     archetype: 'corporate',
-    coords: [-6.4, -0.8],
+    coords: [3.5, -1.6],
     defaultVulns: ['SIM-VULN-003', 'SIM-VULN-004', 'SIM-VULN-005'],
   },
   {
     slotId: 'BLD-TEL-01',
     name: 'Pulse-6G Spine Tower',
     archetype: 'telecom',
-    coords: [-1.4, -0.8],
+    coords: [-6.2, -4.6],
     defaultVulns: ['SIM-VULN-009', 'SIM-VULN-003'],
   },
   {
     slotId: 'BLD-FIN-01',
     name: 'Quant-Fin Exchange Spire',
     archetype: 'financial',
-    coords: [3.6, -0.9],
+    coords: [5.4, 4.4],
     defaultVulns: ['SIM-VULN-003', 'SIM-VULN-005'],
   },
   {
     slotId: 'BLD-DC-01',
     name: 'Hyper-DC Core Vault',
     archetype: 'datacenter',
-    coords: [7.4, -1.2],
+    coords: [6.4, -0.4],
     defaultVulns: ['SIM-VULN-007', 'SIM-VULN-006', 'SIM-VULN-005'],
   },
   {
     slotId: 'BLD-FAC-01',
     name: 'Cyber-Fab Robotics Plant',
     archetype: 'factory',
-    coords: [-6.0, 4.6],
+    coords: [-5.8, -0.8],
     defaultVulns: ['SIM-VULN-008', 'SIM-VULN-009'],
   },
   {
     slotId: 'BLD-POW-01',
     name: 'Volt-01 Fusion Substation',
     archetype: 'power',
-    coords: [-1.2, 4.8],
+    coords: [-4.6, 2.2],
     defaultVulns: ['SIM-VULN-008', 'SIM-VULN-010'],
   },
   {
     slotId: 'BLD-HOS-01',
     name: 'Vita-Care Bio-Medical Center',
     archetype: 'hospital',
-    coords: [4.2, 4.6],
+    coords: [3.3, 2.0],
     defaultVulns: ['SIM-VULN-005', 'SIM-VULN-008'],
   },
 ];
@@ -256,11 +256,11 @@ export function generateCity(config = {}) {
   for (let i = 0; i < CORE_TEN_BLUEPRINT.length; i++) {
     const bp = CORE_TEN_BLUEPRINT[i];
     const arch = BUILDING_ARCHETYPES[bp.archetype];
-    const jitterX = rng.float(-0.45, 0.45);
-    const jitterZ = rng.float(-0.45, 0.45);
+    const jitterX = rng.float(-0.16, 0.16);
+    const jitterZ = rng.float(-0.16, 0.16);
     const height = Number(rng.float(arch.baseHeight[0], arch.baseHeight[1]).toFixed(2));
-    const width = Number((arch.footprint[0] * rng.float(0.92, 1.08)).toFixed(2));
-    const depth = Number((arch.footprint[1] * rng.float(0.92, 1.08)).toFixed(2));
+    const width = Number((arch.footprint[0] * rng.float(0.94, 1.04)).toFixed(2));
+    const depth = Number((arch.footprint[1] * rng.float(0.94, 1.04)).toFixed(2));
 
     buildings.push(
       buildSingleNode({
@@ -290,16 +290,19 @@ export function generateCity(config = {}) {
     const arch = BUILDING_ARCHETYPES[archKey];
     const ringIndex = Math.floor(e / 10) + 1;
     const angle = ((e % 11) / 11) * Math.PI * 2 + rng.float(-0.18, 0.18);
-    const radius = 10.5 + ringIndex * 4.2 + rng.float(-0.8, 0.8);
+    const radius = 11.2 + ringIndex * 4.2 + rng.float(-0.6, 0.6);
     let x = Number((Math.cos(angle) * radius).toFixed(2));
     let z = Number((Math.sin(angle) * radius).toFixed(2));
 
-    // Avoid overlap
-    for (let attempt = 0; attempt < 12; attempt++) {
+    // Keep clear of central avenue corridor (x between -2.8 and +1.2) and existing buildings
+    for (let attempt = 0; attempt < 16; attempt++) {
+      if (x > -2.8 && x < 1.2) {
+        x = x < -0.8 ? -3.4 : 2.0;
+      }
       const tooClose = usedCoords.some(([ux, uz]) => Math.hypot(ux - x, uz - z) < 3.6);
       if (!tooClose) break;
-      x = Number((x + rng.float(-2.5, 2.5)).toFixed(2));
-      z = Number((z + rng.float(-2.5, 2.5)).toFixed(2));
+      x = Number((x + rng.float(-2.8, 2.8)).toFixed(2));
+      z = Number((z + rng.float(-2.8, 2.8)).toFixed(2));
     }
     usedCoords.push([x, z]);
 
