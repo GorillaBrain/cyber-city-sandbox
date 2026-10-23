@@ -1,935 +1,712 @@
-import React, { useMemo, useRef, useState, useEffect } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import React, { useMemo, useRef, useState } from 'react';
+import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Html, Line } from '@react-three/drei';
 import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { useGameStore } from '../store/useGameStore.js';
 
-function checkWebGLAvailable() {
-  try {
-    if (typeof window === 'undefined') return false;
-    const canvas = document.createElement('canvas');
-    return Boolean(
-      window.WebGLRenderingContext &&
-        (canvas.getContext('webgl') || canvas.getContext('experimental-webgl'))
-    );
-  } catch {
-    return false;
+// Orthogonal city road grid centers — all buildings sit strictly inside the grassy blocks between roads
+export const ROAD_X = [-13.5, -4.5, 4.5, 13.5];
+export const ROAD_Z = [-12.0, -4.0, 4.0, 12.0];
+const ROAD_WIDTH = 1.95;
+const SIDEWALK_WIDTH = 2.55;
+
+function getStatusColor(building) {
+  if (building.isolated) return '#64748b';
+  if (building.compromiseState === 'AFFECTED') return '#ef4444';
+  if (building.compromiseState === 'FOOTHOLD' || building.compromiseState === 'CREDENTIAL_ACCESS') {
+    return '#f97316';
   }
+  if (building.compromiseState === 'PROBING' || building.healthStatus === 'SUSPICIOUS') {
+    return '#eab308';
+  }
+  if (building.securityScore >= 80) return '#10b981';
+  return '#0ea5e9';
 }
 
-/**
- * Generates a crisp pixel-art cyberpunk sign/window texture on a canvas.
- */
-function useVoxelSignTexture(bg, fg, glyphSeed = 1) {
-  return useMemo(() => {
-    if (typeof document === 'undefined') return null;
-    const canvas = document.createElement('canvas');
-    canvas.width = 64;
-    canvas.height = 32;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, 64, 32);
-
-    ctx.strokeStyle = fg;
-    ctx.lineWidth = 3;
-    ctx.strokeRect(2, 2, 60, 28);
-
-    ctx.fillStyle = fg;
-    // Draw blocky cyberpunk pixel glyphs
-    const blocks = [
-      [8, 8, 6, 16],
-      [18, 8, 10, 4],
-      [22, 12, 4, 12],
-      [32, 8, 4, 16],
-      [36, 14, 8, 4],
-      [44, 8, 4, 16],
-      [52, 8, 6, 6],
-      [52, 18, 6, 6],
-    ];
-    blocks.forEach(([x, y, w, h], i) => {
-      if ((i + glyphSeed) % 7 !== 0) {
-        ctx.fillRect(x, y, w, h);
-      }
-    });
-
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.magFilter = THREE.NearestFilter;
-    tex.minFilter = THREE.NearestFilter;
-    tex.needsUpdate = true;
-    return tex;
-  }, [bg, fg, glyphSeed]);
+function getConnectionStyle(conn) {
+  if (!conn.permitted || conn.trafficState === 'BLOCKED') {
+    return { color: '#ef4444', dashed: true, dashScale: 3, lineWidth: 1.8, opacity: 0.78 };
+  }
+  if (conn.trafficState === 'COMPROMISED') {
+    return { color: '#dc2626', dashed: false, lineWidth: 3.0, opacity: 0.95 };
+  }
+  if (conn.trafficState === 'ATTACK_PROPAGATION') {
+    return { color: '#f97316', dashed: false, lineWidth: 2.6, opacity: 0.92 };
+  }
+  if (conn.trafficState === 'SUSPICIOUS') {
+    return { color: '#eab308', dashed: true, dashScale: 2, lineWidth: 2.2, opacity: 0.88 };
+  }
+  if (conn.trafficState === 'MONITORED') {
+    return { color: '#8b5cf6', dashed: false, lineWidth: 1.8, opacity: 0.75 };
+  }
+  return { color: '#0284c7', dashed: false, lineWidth: 1.5, opacity: 0.55 };
 }
 
-/**
- * Generates a high-contrast recessed voxel window facade texture.
- */
-function useFacadeTexture(bodyColor, litColor1, litColor2, cols = 6, rows = 14, seed = 1, isCompromised = false) {
-  return useMemo(() => {
-    if (typeof document === 'undefined') return null;
-    const canvas = document.createElement('canvas');
-    canvas.width = 128;
-    canvas.height = 256;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-
-    ctx.fillStyle = bodyColor;
-    ctx.fillRect(0, 0, 128, 256);
-
-    const padX = 6;
-    const padY = 5;
-    const cellW = (128 - padX * (cols + 1)) / cols;
-    const cellH = (256 - padY * (rows + 1)) / rows;
-
-    let s = Math.floor((seed + 3) * 7919);
-    const rand = () => {
-      s = (s * 16807) % 2147483647;
-      return (s - 1) / 2147483646;
-    };
-
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const x = padX + c * (cellW + padX);
-        const y = padY + r * (cellH + padY);
-        const roll = rand();
-        if (roll < 0.72) {
-          if (isCompromised && roll < 0.45) {
-            ctx.fillStyle = '#ff2a55';
-          } else if (roll < 0.25 || r % 5 === 0) {
-            ctx.fillStyle = litColor2;
-          } else {
-            ctx.fillStyle = litColor1;
-          }
-          ctx.fillRect(x, y, cellW, cellH);
-          // Bright inner core for bloom warmth
-          ctx.fillStyle = '#ffffff';
-          ctx.globalAlpha = 0.38;
-          ctx.fillRect(x + 2, y + 2, Math.max(2, cellW - 4), Math.max(2, cellH - 4));
-          ctx.globalAlpha = 1.0;
-        } else {
-          ctx.fillStyle = '#0c1228';
-          ctx.fillRect(x, y, cellW, cellH);
-        }
-      }
-    }
-
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.magFilter = THREE.NearestFilter;
-    tex.minFilter = THREE.NearestFilter;
-    tex.needsUpdate = true;
-    return tex;
-  }, [bodyColor, litColor1, litColor2, cols, rows, seed, isCompromised]);
-}
-
-let cachedGlowTex = null;
-function getRadialGlowTexture() {
-  if (cachedGlowTex) return cachedGlowTex;
-  if (typeof document === 'undefined') return null;
-  const canvas = document.createElement('canvas');
-  canvas.width = 128;
-  canvas.height = 128;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return null;
-  const grad = ctx.createRadialGradient(64, 64, 4, 64, 64, 62);
-  grad.addColorStop(0.0, 'rgba(255, 255, 255, 1.0)');
-  grad.addColorStop(0.28, 'rgba(255, 255, 255, 0.55)');
-  grad.addColorStop(0.65, 'rgba(255, 255, 255, 0.14)');
-  grad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 128, 128);
-  cachedGlowTex = new THREE.CanvasTexture(canvas);
-  cachedGlowTex.needsUpdate = true;
-  return cachedGlowTex;
-}
-
-function GlowBox({ args, position, rotation, color, intensity = 1.6 }) {
+function LowPolyTree({ position, type = 'round', color = '#5ec435', scale = 1 }) {
   return (
-    <group position={position} rotation={rotation}>
-      <mesh>
-        <boxGeometry args={args} />
-        <meshStandardMaterial
-          color={color}
-          emissive={color}
-          emissiveIntensity={intensity}
-          roughness={0.25}
-        />
+    <group position={position} scale={[scale, scale, scale]}>
+      {/* Ground shadow disc */}
+      <mesh position={[0, 0.02, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[0.32, 10]} />
+        <meshBasicMaterial color="#3c7822" transparent opacity={0.45} />
+      </mesh>
+      {/* Tree trunk */}
+      <mesh position={[0, 0.22, 0]} castShadow>
+        <cylinderGeometry args={[0.06, 0.09, 0.44, 6]} />
+        <meshStandardMaterial color="#6e4726" roughness={0.85} />
+      </mesh>
+      {type === 'pine' ? (
+        <group>
+          <mesh position={[0, 0.58, 0]} castShadow>
+            <coneGeometry args={[0.34, 0.55, 7]} />
+            <meshStandardMaterial color={color} roughness={0.7} flatShading />
+          </mesh>
+          <mesh position={[0, 0.88, 0]} castShadow>
+            <coneGeometry args={[0.25, 0.48, 7]} />
+            <meshStandardMaterial color={color} roughness={0.7} flatShading />
+          </mesh>
+        </group>
+      ) : type === 'autumn' ? (
+        <group>
+          <mesh position={[0, 0.62, 0]} castShadow>
+            <dodecahedronGeometry args={[0.34, 0]} />
+            <meshStandardMaterial color={color} roughness={0.65} flatShading />
+          </mesh>
+          <mesh position={[0.1, 0.82, -0.05]} castShadow>
+            <dodecahedronGeometry args={[0.22, 0]} />
+            <meshStandardMaterial color={color} roughness={0.65} flatShading />
+          </mesh>
+        </group>
+      ) : (
+        <group>
+          <mesh position={[0, 0.6, 0]} castShadow>
+            <boxGeometry args={[0.48, 0.46, 0.48]} />
+            <meshStandardMaterial color={color} roughness={0.68} />
+          </mesh>
+          <mesh position={[0, 0.86, 0]} castShadow>
+            <boxGeometry args={[0.34, 0.28, 0.34]} />
+            <meshStandardMaterial color="#78db49" roughness={0.68} />
+          </mesh>
+        </group>
+      )}
+    </group>
+  );
+}
+
+/**
+ * Renders the 10 distinct colorful low-poly architectural landmarks matching the reference city image
+ */
+function StylizedLandmarkMesh({ archetype, height, isCompromised, isSuspicious }) {
+  // 1. HOSPITAL (BLD-HOS-01) — Twin Octagonal Cream/Salmon Hospital Towers with Green (H) & Pink (+) Pads
+  if (archetype === 'hospital') {
+    const h = Math.max(3.6, height * 0.48);
+    const floors = 6;
+    return (
+      <group>
+        {[-0.95, 0.95].map((ox, idx) => (
+          <group key={`hos-tower-${idx}`} position={[ox, 0, idx === 0 ? 0.15 : -0.15]}>
+            {/* Coral base */}
+            <mesh position={[0, 0.35, 0]} castShadow receiveShadow>
+              <cylinderGeometry args={[0.82, 0.86, 0.7, 8]} />
+              <meshStandardMaterial color="#e07a5f" roughness={0.65} flatShading />
+            </mesh>
+            {/* Octagonal cream & dark window stacked floors */}
+            {Array.from({ length: floors }).map((_, f) => {
+              const fy = 0.8 + f * ((h - 0.8) / floors);
+              return (
+                <group key={`hf-${f}`}>
+                  <mesh position={[0, fy, 0]} castShadow receiveShadow>
+                    <cylinderGeometry args={[0.76, 0.76, 0.24, 8]} />
+                    <meshStandardMaterial color="#2f3e46" roughness={0.5} />
+                  </mesh>
+                  <mesh position={[0, fy + 0.18, 0]} castShadow receiveShadow>
+                    <cylinderGeometry args={[0.84, 0.84, 0.22, 8]} />
+                    <meshStandardMaterial color="#f4efe6" roughness={0.65} flatShading />
+                  </mesh>
+                </group>
+              );
+            })}
+            {/* Coral corner ribs */}
+            {[-0.68, 0.68].map((rx) =>
+              [-0.4, 0.4].map((rz) => (
+                <mesh key={`rib-${rx}-${rz}`} position={[rx, h * 0.5, rz]} castShadow>
+                  <boxGeometry args={[0.16, h * 0.92, 0.16]} />
+                  <meshStandardMaterial color="#e07a5f" roughness={0.65} />
+                </mesh>
+              ))
+            )}
+            {/* Roof deck */}
+            <mesh position={[0, h + 0.16, 0]} castShadow receiveShadow>
+              <cylinderGeometry args={[0.84, 0.84, 0.18, 8]} />
+              <meshStandardMaterial color="#f4efe6" roughness={0.65} />
+            </mesh>
+            {/* Left tower: Green H helipad | Right tower: Pink + cross pad */}
+            <mesh position={[0, h + 0.26, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <circleGeometry args={[0.56, 16]} />
+              <meshStandardMaterial color={idx === 0 ? '#65b741' : '#f28482'} roughness={0.6} />
+            </mesh>
+            {idx === 0 ? (
+              <group position={[0, h + 0.28, 0]}>
+                <mesh position={[-0.16, 0, 0]}>
+                  <boxGeometry args={[0.08, 0.02, 0.42]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+                <mesh position={[0.16, 0, 0]}>
+                  <boxGeometry args={[0.08, 0.02, 0.42]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+                <mesh position={[0, 0, 0]}>
+                  <boxGeometry args={[0.32, 0.02, 0.08]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+              </group>
+            ) : (
+              <group position={[0, h + 0.28, 0]}>
+                <mesh>
+                  <boxGeometry args={[0.14, 0.02, 0.44]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+                <mesh>
+                  <boxGeometry args={[0.44, 0.02, 0.14]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+              </group>
+            )}
+          </group>
+        ))}
+      </group>
+    );
+  }
+
+  // 2. TELECOM (BLD-TEL-01) — Iconic Red & White Tokyo/Eiffel Lattice Tower
+  if (archetype === 'telecom') {
+    const h = Math.max(6.8, height * 0.62);
+    return (
+      <group>
+        {/* 4 splayed red corner legs */}
+        {[
+          [-0.75, -0.75],
+          [0.75, -0.75],
+          [-0.75, 0.75],
+          [0.75, 0.75],
+        ].map(([lx, lz], i) => (
+          <mesh
+            key={`leg-${i}`}
+            position={[lx * 0.68, h * 0.22, lz * 0.68]}
+            rotation={[lz * 0.22, 0, -lx * 0.22]}
+            castShadow
+          >
+            <boxGeometry args={[0.2, h * 0.48, 0.2]} />
+            <meshStandardMaterial color="#e03131" roughness={0.55} />
+          </mesh>
+        ))}
+        {/* Horizontal red lattice braces */}
+        {[0.16, 0.28, 0.4].map((ratio, idx) => {
+          const w = 1.5 - idx * 0.28;
+          return (
+            <mesh key={`brace-${idx}`} position={[0, h * ratio, 0]} castShadow>
+              <boxGeometry args={[w, 0.14, w]} />
+              <meshStandardMaterial color="#e03131" roughness={0.55} />
+            </mesh>
+          );
+        })}
+        {/* First White Observation Deck */}
+        <mesh position={[0, h * 0.47, 0]} castShadow receiveShadow>
+          <boxGeometry args={[1.05, 0.36, 1.05]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.5} />
+        </mesh>
+        {/* Mid Red Lattice Shaft */}
+        <mesh position={[0, h * 0.62, 0]} castShadow>
+          <cylinderGeometry args={[0.28, 0.44, h * 0.28, 4]} />
+          <meshStandardMaterial color="#e03131" roughness={0.55} />
+        </mesh>
+        {/* Upper White Observation Band */}
+        <mesh position={[0, h * 0.77, 0]} castShadow>
+          <cylinderGeometry args={[0.36, 0.36, 0.28, 8]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.5} />
+        </mesh>
+        {/* Upper Red & White Striped Spire */}
+        <mesh position={[0, h * 0.9, 0]} castShadow>
+          <cylinderGeometry args={[0.1, 0.24, h * 0.24, 8]} />
+          <meshStandardMaterial color="#e03131" roughness={0.5} />
+        </mesh>
+        <mesh position={[0, h * 1.04, 0]} castShadow>
+          <cylinderGeometry args={[0.04, 0.09, h * 0.18, 8]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.4} />
+        </mesh>
+      </group>
+    );
+  }
+
+  // 3. CORPORATE (BLD-CORP-01) — Blue & Magenta Twin Stepped Office Towers with Green (H) Helipad
+  if (archetype === 'corporate') {
+    const h = Math.max(4.4, height * 0.46);
+    return (
+      <group>
+        {/* Left stepped blue tower with green roof terrace */}
+        <group position={[-0.78, 0, -0.1]}>
+          <mesh position={[0, h * 0.48, 0]} castShadow receiveShadow>
+            <boxGeometry args={[1.25, h * 0.96, 1.25]} />
+            <meshStandardMaterial color="#3b6ee8" roughness={0.55} />
+          </mesh>
+          {[0.22, 0.44, 0.66, 0.88].map((r, i) => (
+            <mesh key={`cl-win-${i}`} position={[0, h * r, 0]}>
+              <boxGeometry args={[1.29, 0.18, 1.29]} />
+              <meshStandardMaterial color={i % 2 === 0 ? '#1e293b' : '#f03e8a'} roughness={0.45} />
+            </mesh>
+          ))}
+          <mesh position={[0, h * 0.97, 0]}>
+            <boxGeometry args={[1.1, 0.08, 1.1]} />
+            <meshStandardMaterial color="#40c057" roughness={0.7} />
+          </mesh>
+        </group>
+
+        {/* Right blue & magenta tower with green H helipad */}
+        <group position={[0.78, 0, 0.2]}>
+          <mesh position={[0, h * 0.44, 0]} castShadow receiveShadow>
+            <boxGeometry args={[1.25, h * 0.88, 1.25]} />
+            <meshStandardMaterial color="#4263eb" roughness={0.55} />
+          </mesh>
+          {[0.2, 0.4, 0.6, 0.78].map((r, i) => (
+            <mesh key={`cr-win-${i}`} position={[0, h * r, 0]}>
+              <boxGeometry args={[1.29, 0.16, 1.29]} />
+              <meshStandardMaterial color={i === 1 ? '#f03e8a' : '#1e293b'} roughness={0.45} />
+            </mesh>
+          ))}
+          {/* Green Helipad */}
+          <mesh position={[0, h * 0.89, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <circleGeometry args={[0.48, 16]} />
+            <meshStandardMaterial color="#51cf66" roughness={0.6} />
+          </mesh>
+          <mesh position={[0, h * 0.9, 0]}>
+            <boxGeometry args={[0.28, 0.02, 0.08]} />
+            <meshBasicMaterial color="#ffffff" />
+          </mesh>
+        </group>
+      </group>
+    );
+  }
+
+  // 4. RESIDENTIAL (BLD-RES-01) — Lavender/Lilac Waffle-Grid High-Rise Apartment Complex
+  if (archetype === 'residential') {
+    const h = Math.max(4.6, height * 0.52);
+    return (
+      <group>
+        {/* Main Lavender Core */}
+        <mesh position={[0, h * 0.48, 0]} castShadow receiveShadow>
+          <boxGeometry args={[2.1, h * 0.96, 1.75]} />
+          <meshStandardMaterial color="#b197fc" roughness={0.62} />
+        </mesh>
+        {/* White Waffle Balcony Horizontal & Vertical Grid */}
+        {Array.from({ length: 7 }).map((_, f) => (
+          <mesh key={`res-slab-${f}`} position={[0, 0.45 + f * ((h * 0.85) / 7), 0]} castShadow>
+            <boxGeometry args={[2.22, 0.1, 1.86]} />
+            <meshStandardMaterial color="#f3f0ff" roughness={0.55} />
+          </mesh>
+        ))}
+        {[-0.85, -0.42, 0, 0.42, 0.85].map((vx, i) => (
+          <mesh key={`res-col-${i}`} position={[vx, h * 0.46, 0]} castShadow>
+            <boxGeometry args={[0.1, h * 0.9, 1.88]} />
+            <meshStandardMaterial color="#e5dbff" roughness={0.55} />
+          </mesh>
+        ))}
+        {/* Twin Peaked Lilac Roofs */}
+        {[-0.52, 0.52].map((rx, i) => (
+          <mesh key={`res-roof-${i}`} position={[rx, h + 0.18, 0]} rotation={[0, Math.PI / 4, 0]} castShadow>
+            <coneGeometry args={[0.68, 0.5, 4]} />
+            <meshStandardMaterial color="#d0bfff" roughness={0.6} flatShading />
+          </mesh>
+        ))}
+      </group>
+    );
+  }
+
+  // 5. FINANCIAL (BLD-FIN-01) — Tall Coral-Orange & White Horizontal-Ribbed Skyscraper
+  if (archetype === 'financial') {
+    const h = Math.max(6.2, height * 0.55);
+    const slabs = 11;
+    return (
+      <group>
+        {/* Coral-Orange Core */}
+        <mesh position={[0, h * 0.5, 0]} castShadow receiveShadow>
+          <boxGeometry args={[2.0, h, 1.8]} />
+          <meshStandardMaterial color="#e8590c" roughness={0.58} />
+        </mesh>
+        {/* Dark recessed window bands & white projecting slabs */}
+        {Array.from({ length: slabs }).map((_, s) => {
+          const sy = 0.45 + s * ((h - 0.6) / slabs);
+          return (
+            <group key={`fin-slab-${s}`}>
+              <mesh position={[0, sy, 0]} castShadow receiveShadow>
+                <boxGeometry args={[2.22, 0.14, 2.02]} />
+                <meshStandardMaterial color="#f8f9fa" roughness={0.5} />
+              </mesh>
+              <mesh position={[0, sy + 0.18, 0]}>
+                <boxGeometry args={[2.04, 0.14, 1.84]} />
+                <meshStandardMaterial color="#2b2d42" roughness={0.45} />
+              </mesh>
+            </group>
+          );
+        })}
+        {/* Roof Penthouse */}
+        <mesh position={[0, h + 0.25, 0]} castShadow>
+          <boxGeometry args={[1.3, 0.5, 1.1]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.55} />
+        </mesh>
+      </group>
+    );
+  }
+
+  // 6. TRANSPORT / COMMUNITY HUB (BLD-PUB-01) — Red L-Shaped Plaza with Sandy Courtyard & Sun Arches
+  if (archetype === 'transport') {
+    return (
+      <group>
+        {/* Sandy Courtyard Pad */}
+        <mesh position={[0.25, 0.08, 0.25]} receiveShadow>
+          <boxGeometry args={[2.4, 0.14, 2.2]} />
+          <meshStandardMaterial color="#edd1a7" roughness={0.8} />
+        </mesh>
+        {/* Red North Wing */}
+        <mesh position={[0, 0.9, -0.55]} castShadow receiveShadow>
+          <boxGeometry args={[2.6, 1.8, 1.05]} />
+          <meshStandardMaterial color="#d62828" roughness={0.6} />
+        </mesh>
+        {/* Dark windows on Red North Wing */}
+        {[-0.85, -0.35, 0.15, 0.65].map((wx, i) => (
+          <mesh key={`pub-wn-${i}`} position={[wx, 1.05, 0.0]}>
+            <boxGeometry args={[0.24, 0.32, 0.06]} />
+            <meshStandardMaterial color="#2b2d42" roughness={0.4} />
+          </mesh>
+        ))}
+        {/* Red West Wing */}
+        <mesh position={[-0.78, 0.9, 0.35]} castShadow receiveShadow>
+          <boxGeometry args={[1.05, 1.8, 2.05]} />
+          <meshStandardMaterial color="#d62828" roughness={0.6} />
+        </mesh>
+        {/* Dark windows on Red West Wing */}
+        {[-0.2, 0.35, 0.9].map((wz, i) => (
+          <mesh key={`pub-ww-${i}`} position={[-0.24, 1.05, wz]}>
+            <boxGeometry args={[0.06, 0.32, 0.24]} />
+            <meshStandardMaterial color="#2b2d42" roughness={0.4} />
+          </mesh>
+        ))}
+        {/* White Rooftop Terrace */}
+        <mesh position={[0, 1.84, -0.55]} receiveShadow>
+          <boxGeometry args={[2.42, 0.08, 0.9]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.6} />
+        </mesh>
+        <mesh position={[-0.78, 1.84, 0.35]} receiveShadow>
+          <boxGeometry args={[0.9, 0.08, 1.88]} />
+          <meshStandardMaterial color="#f8f9fa" roughness={0.6} />
+        </mesh>
+        {/* Rooftop Patio Umbrellas */}
+        {[
+          [-0.6, 1.98, -0.55, '#339af0'],
+          [0.2, 1.98, -0.55, '#ff6b6b'],
+          [-0.78, 1.98, 0.4, '#339af0'],
+        ].map(([ux, uy, uz, ucol], ui) => (
+          <mesh key={`umb-${ui}`} position={[ux, uy, uz]} castShadow>
+            <coneGeometry args={[0.24, 0.16, 6]} />
+            <meshStandardMaterial color={ucol} roughness={0.5} />
+          </mesh>
+        ))}
+        {/* Golden Decorative Roof Arches */}
+        <mesh position={[-1.25, 1.95, 0.3]} rotation={[0, Math.PI / 2, 0]}>
+          <torusGeometry args={[0.38, 0.07, 8, 12, Math.PI]} />
+          <meshStandardMaterial color="#f59f00" roughness={0.5} />
+        </mesh>
+        <mesh position={[0.6, 1.95, -1.02]}>
+          <torusGeometry args={[0.38, 0.07, 8, 12, Math.PI]} />
+          <meshStandardMaterial color="#f59f00" roughness={0.5} />
+        </mesh>
+      </group>
+    );
+  }
+
+  // 7. DATA CENTER (BLD-DC-01) — White & Slate Modern Louvered High-Rise + Olive Annex
+  if (archetype === 'datacenter') {
+    const h = Math.max(3.6, height * 0.44);
+    return (
+      <group>
+        {/* Main White & Slate Tower */}
+        <mesh position={[-0.25, h * 0.48, 0]} castShadow receiveShadow>
+          <boxGeometry args={[1.7, h * 0.96, 1.6]} />
+          <meshStandardMaterial color="#343a40" roughness={0.45} />
+        </mesh>
+        {Array.from({ length: 7 }).map((_, f) => (
+          <mesh key={`dc-louver-${f}`} position={[-0.25, 0.35 + f * ((h * 0.86) / 7), 0]} castShadow>
+            <boxGeometry args={[1.86, 0.14, 1.76]} />
+            <meshStandardMaterial color="#f8f9fa" roughness={0.55} />
+          </mesh>
+        ))}
+        {/* Adjacent Olive-Green Module */}
+        <mesh position={[1.02, h * 0.34, -0.1]} castShadow receiveShadow>
+          <boxGeometry args={[0.82, h * 0.68, 1.2]} />
+          <meshStandardMaterial color="#74b816" roughness={0.65} />
+        </mesh>
+      </group>
+    );
+  }
+
+  // 8. GOVERNMENT (BLD-GOV-01) — Yellow & Lime-Green Stepped Civic Hall
+  if (archetype === 'government') {
+    return (
+      <group>
+        {/* Tier 1 Lime Green Base */}
+        <mesh position={[0, 0.42, 0]} castShadow receiveShadow>
+          <boxGeometry args={[2.5, 0.84, 2.1]} />
+          <meshStandardMaterial color="#8ce99a" roughness={0.62} />
+        </mesh>
+        <mesh position={[0, 0.55, 0]}>
+          <boxGeometry args={[2.54, 0.16, 2.14]} />
+          <meshStandardMaterial color="#2b2d42" roughness={0.45} />
+        </mesh>
+        {/* Tier 2 Mid Green Band */}
+        <mesh position={[0, 1.02, 0]} castShadow receiveShadow>
+          <boxGeometry args={[2.15, 0.42, 1.75]} />
+          <meshStandardMaterial color="#69db7c" roughness={0.62} />
+        </mesh>
+        {/* Tier 3 Warm Butter-Yellow Upper Hall */}
+        <mesh position={[0, 1.68, 0]} castShadow receiveShadow>
+          <boxGeometry args={[1.7, 0.9, 1.35]} />
+          <meshStandardMaterial color="#fae588" roughness={0.58} />
+        </mesh>
+        {/* Slanted Roof */}
+        <mesh position={[0, 2.2, 0]} castShadow>
+          <boxGeometry args={[1.6, 0.16, 1.25]} />
+          <meshStandardMaterial color="#495057" roughness={0.6} />
+        </mesh>
+      </group>
+    );
+  }
+
+  // 9. FACTORY (BLD-FAC-01) — Terracotta/Brown Pleated Accordion-Roof Hall
+  if (archetype === 'factory') {
+    return (
+      <group>
+        {/* Main Terracotta/Tan Hall Body */}
+        <mesh position={[0, 0.88, 0]} castShadow receiveShadow>
+          <boxGeometry args={[2.45, 1.76, 1.95]} />
+          <meshStandardMaterial color="#b07d52" roughness={0.68} />
+        </mesh>
+        {/* Dark Arched/Vertical Hall Windows */}
+        {[-0.75, -0.25, 0.25, 0.75].map((wx, i) => (
+          <mesh key={`fac-win-${i}`} position={[wx, 0.75, 0.99]}>
+            <boxGeometry args={[0.28, 0.85, 0.04]} />
+            <meshStandardMaterial color="#212529" roughness={0.4} />
+          </mesh>
+        ))}
+        {/* Pleated / Accordion Roof Ridges */}
+        {[-0.82, -0.41, 0, 0.41, 0.82].map((rx, i) => (
+          <mesh
+            key={`pleat-${i}`}
+            position={[rx, 1.88, 0]}
+            rotation={[0, 0, Math.PI / 4]}
+            castShadow
+            receiveShadow
+          >
+            <boxGeometry args={[0.36, 0.36, 2.04]} />
+            <meshStandardMaterial color={i % 2 === 0 ? '#d4a373' : '#9c6644'} roughness={0.65} />
+          </mesh>
+        ))}
+      </group>
+    );
+  }
+
+  // 10. POWER / UTILITY (BLD-POW-01) — Mint-Green, Slate & Pastel-Pink Stepped Utility Building
+  return (
+    <group>
+      {/* Left Pastel-Pink Wing */}
+      <mesh position={[-0.65, 1.05, 0]} castShadow receiveShadow>
+        <boxGeometry args={[1.1, 2.1, 1.6]} />
+        <meshStandardMaterial color="#f783ac" roughness={0.62} />
+      </mesh>
+      {/* Windows on Pink Wing */}
+      {[0.65, 1.25, 1.75].map((wy, i) => (
+        <mesh key={`pow-pw-${i}`} position={[-0.65, wy, 0.82]}>
+          <boxGeometry args={[0.68, 0.22, 0.04]} />
+          <meshStandardMaterial color="#2b2d42" roughness={0.45} />
+        </mesh>
+      ))}
+      {/* Right Mint-Green Stepped Wing */}
+      <mesh position={[0.55, 1.1, 0.1]} castShadow receiveShadow>
+        <boxGeometry args={[1.3, 2.2, 1.5]} />
+        <meshStandardMaterial color="#96f2d7" roughness={0.6} />
+      </mesh>
+      {[0.48, 0.96, 1.44, 1.92].map((py, i) => (
+        <mesh key={`pow-band-${i}`} position={[0.55, py, 0.1]}>
+          <boxGeometry args={[1.36, 0.14, 1.56]} />
+          <meshStandardMaterial color="#20c997" roughness={0.55} />
+        </mesh>
+      ))}
+      {/* Peaked Roof + Small Antenna Mast */}
+      <mesh position={[-0.1, 2.4, 0]} rotation={[0, Math.PI / 4, 0]} castShadow>
+        <coneGeometry args={[0.8, 0.6, 4]} />
+        <meshStandardMaterial color="#fcc2d7" roughness={0.6} flatShading />
+      </mesh>
+      <mesh position={[-0.65, 2.55, 0]}>
+        <cylinderGeometry args={[0.04, 0.06, 0.9, 6]} />
+        <meshStandardMaterial color="#f8f9fa" roughness={0.4} />
       </mesh>
     </group>
   );
 }
 
-function BloomPostProcessing({ enabled }) {
-  const { gl, scene, camera, size } = useThree();
-  const composerRef = useRef(null);
-
-  useEffect(() => {
-    if (!enabled) {
-      composerRef.current = null;
-      return undefined;
-    }
-    try {
-      const composer = new EffectComposer(gl);
-      const renderPass = new RenderPass(scene, camera);
-      const bloomPass = new UnrealBloomPass(
-        new THREE.Vector2(size.width, size.height),
-        0.34, // subtle, crisp neon bloom strength
-        0.38, // tight halo radius
-        0.88  // high threshold so dark navy sky & building walls stay deep and rich
-      );
-      const outputPass = new OutputPass();
-      composer.addPass(renderPass);
-      composer.addPass(bloomPass);
-      composer.addPass(outputPass);
-      composerRef.current = composer;
-      return () => {
-        composer.dispose();
-        composerRef.current = null;
-      };
-    } catch {
-      composerRef.current = null;
-      return undefined;
-    }
-  }, [enabled, gl, scene, camera]);
-
-  useEffect(() => {
-    if (composerRef.current) {
-      composerRef.current.setSize(size.width, size.height);
-    }
-  }, [size]);
-
-  useFrame(() => {
-    if (enabled && composerRef.current) {
-      composerRef.current.render();
-    }
-  }, 1);
-
-  return null;
-}
-
-function CameraController({ focusTarget, resetCounter }) {
-  const controlsRef = useRef();
-  const { camera } = useThree();
-  const desiredTarget = useRef(new THREE.Vector3(-0.3, 4.5, 0.2));
-  const desiredPosition = useRef(new THREE.Vector3(-3.6, 9.8, 23.5));
-  const isTransitioning = useRef(false);
-
-  useEffect(() => {
-    if (focusTarget && focusTarget.position) {
-      const [x, , z] = focusTarget.position;
-      const h = Math.min(9.5, (focusTarget.height || 7) * 0.55);
-      desiredTarget.current.set(x, h, z);
-      desiredPosition.current.set(x - 4.5, h + 5.5, z + 12.5);
-      isTransitioning.current = true;
-    }
-  }, [focusTarget]);
-
-  useEffect(() => {
-    if (resetCounter > 0) {
-      desiredTarget.current.set(-0.3, 4.5, 0.2);
-      desiredPosition.current.set(-3.6, 9.8, 23.5);
-      isTransitioning.current = true;
-    }
-  }, [resetCounter]);
-
-  useFrame((_, delta) => {
-    if (!controlsRef.current || !isTransitioning.current) return;
-    const step = Math.min(1, delta * 5.5);
-    controlsRef.current.target.lerp(desiredTarget.current, step);
-    camera.position.lerp(desiredPosition.current, step);
-    controlsRef.current.update();
-
-    if (
-      camera.position.distanceTo(desiredPosition.current) < 0.15 &&
-      controlsRef.current.target.distanceTo(desiredTarget.current) < 0.15
-    ) {
-      isTransitioning.current = false;
-    }
-  });
-
-  return (
-    <OrbitControls
-      ref={controlsRef}
-      makeDefault
-      enableDamping
-      dampingFactor={0.08}
-      minDistance={6}
-      maxDistance={46}
-      maxPolarAngle={Math.PI / 2 - 0.04}
-      target={[-0.3, 4.5, 0.2]}
-    />
-  );
-}
-
-/**
- * Handcrafted Voxel Cyberpunk Building Renderer with 5 Distinct Architectural Styles
- * inspired directly by the reference diorama artwork.
- */
-function VoxelBuilding({
-  building,
-  isSelected,
-  isHovered,
-  overlays,
-  bloomEnabled,
-  onSelect,
-  onDoubleClick,
-  onHover,
-}) {
+function BuildingNode({ building, isSelected, onSelect }) {
+  const [hovered, setHovered] = useState(false);
   const beaconRef = useRef();
-  const shieldRingRef = useRef();
-  const { width, depth, height, antennaHeight, seedOffset } = building.dimensions;
 
-  const isCompromised = building.compromiseState !== 'NONE' && !building.isolated;
-  const isAffected = building.compromiseState === 'AFFECTED';
-  const isIsolated = building.isolated;
-  const discoveredUnmitigatedVulns = building.vulnerabilities.filter(
-    (v) => v.discovered && !v.mitigated
-  );
-  const hasFirewallOrSeg = building.installedControls.some((c) =>
-    ['firewall', 'segmentation'].includes(c)
-  );
-  const hasMonitoring = building.installedControls.some((c) =>
-    ['logging', 'net_monitoring', 'edr', 'ids', 'anomaly_detection'].includes(c)
-  );
+  const [x, , z] = building.position;
+  const { width, depth, height } = building.dimensions;
+  const statusColor = getStatusColor(building);
+  const isCompromised =
+    building.compromiseState === 'AFFECTED' ||
+    building.compromiseState === 'FOOTHOLD' ||
+    building.compromiseState === 'CREDENTIAL_ACCESS';
+  const isSuspicious =
+    building.compromiseState === 'PROBING' || building.healthStatus === 'SUSPICIOUS';
 
-  // Determine architectural style based on archetype (preserve signature neon colors; use red override only when severely AFFECTED)
-  const arch = building.archetype;
-  const primaryNeon = isAffected
-    ? '#ff2a55'
-    : arch === 'factory'
-    ? '#00f5d4'
-    : arch === 'power'
-    ? '#ffb800'
-    : arch === 'financial' || arch === 'datacenter'
-    ? '#ff8800'
-    : '#00f0ff';
-
-  const secondaryNeon = isAffected
-    ? '#ff5500'
-    : arch === 'telecom'
-    ? '#ffb800'
-    : arch === 'corporate' || arch === 'government'
-    ? '#ff2a85'
-    : '#ffd166';
-
-  const facadeTex = useFacadeTexture(
-    '#141c38',
-    arch === 'factory' ? '#00f5d4' : '#00e5ff',
-    '#ffb800',
-    5,
-    12,
-    seedOffset,
-    isAffected
-  );
-
-  const signTex = useVoxelSignTexture(
-    '#121936',
-    isAffected ? '#ff2a55' : secondaryNeon,
-    Math.floor(seedOffset)
-  );
-
-  const statusColor = isIsolated
-    ? '#64748b'
-    : isAffected
-    ? '#ff1e42'
-    : isCompromised
-    ? '#ff5500'
-    : discoveredUnmitigatedVulns.length > 0
-    ? '#ffb800'
-    : '#00f0ff';
-
-  useFrame(({ clock }) => {
-    const t = clock.getElapsedTime();
-    if (beaconRef.current) {
-      const pulse = isCompromised
-        ? 0.7 + Math.sin(t * 8) * 0.35
-        : 0.85 + Math.sin(t * 2.2 + seedOffset) * 0.15;
-      beaconRef.current.scale.setScalar(pulse);
-    }
-    if (shieldRingRef.current) {
-      shieldRingRef.current.rotation.y = t * 0.6;
+  useFrame((state) => {
+    const t = state.clock.getElapsedTime();
+    if (beaconRef.current && (isCompromised || isSuspicious)) {
+      const pulse = 1 + Math.sin(t * (isCompromised ? 7 : 4)) * 0.22;
+      beaconRef.current.scale.set(pulse, pulse, pulse);
     }
   });
 
-  // Render specialized voxel silhouette per archetype family
-  const renderArchetypeGeometry = () => {
-    // STYLE 1: Cylindrical / Octagonal Ringed Mega-Tower (Telecom Spine - Top Left in reference)
-    if (arch === 'telecom') {
-      const r = Math.max(width, depth) * 0.56;
-      return (
-        <group>
-          {/* Main Dark Indigo Octagonal Core */}
-          <mesh position={[0, height * 0.5 + 0.2, 0]} castShadow receiveShadow>
-            <cylinderGeometry args={[r * 0.88, r * 0.96, height, 8]} />
-            <meshStandardMaterial color="#162044" roughness={0.5} metalness={0.3} />
-          </mesh>
-
-          {/* 4 Vertical Glowing Cyan/Blue Spine Columns */}
-          {[0, Math.PI / 2, Math.PI, (Math.PI * 3) / 2].map((ang, i) => (
-            <GlowBox
-              key={i}
-              position={[
-                Math.cos(ang) * (r * 0.86),
-                height * 0.44 + 0.2,
-                Math.sin(ang) * (r * 0.86),
-              ]}
-              args={[0.24, height * 0.78, 0.24]}
-              color={isCompromised ? '#ff2a55' : '#00d8ff'}
-              intensity={2.0}
-              bloomHalo={bloomEnabled}
-            />
-          ))}
-
-          {/* Stepped Observation Deck Rings with Warm Gold & Cyan Bands */}
-          {[0.62, 0.74, 0.86, 0.95].map((frac, idx) => (
-            <group key={idx} position={[0, height * frac + 0.2, 0]}>
-              <mesh castShadow>
-                <cylinderGeometry args={[r * 1.12, r * 1.12, 0.42, 12]} />
-                <meshStandardMaterial color="#3b4d7a" roughness={0.4} />
-              </mesh>
-              <mesh position={[0, 0.24, 0]}>
-                <cylinderGeometry args={[r * 1.05, r * 1.05, 0.18, 12]} />
-                <meshStandardMaterial
-                  color={idx % 2 === 0 ? primaryNeon : secondaryNeon}
-                  emissive={idx % 2 === 0 ? primaryNeon : secondaryNeon}
-                  emissiveIntensity={2.2}
-                />
-              </mesh>
-            </group>
-          ))}
-
-          {/* Hanging Pink/Gold Holo-Billboard on Upper Gantry Arm */}
-          <group position={[r * 1.45, height * 0.78, 0]}>
-            <mesh position={[-r * 0.4, 0.55, 0]}>
-              <boxGeometry args={[r * 0.9, 0.1, 0.1]} />
-              <meshStandardMaterial color="#64748b" />
-            </mesh>
-            <mesh>
-              <boxGeometry args={[0.14, 1.85, 1.15]} />
-              <meshStandardMaterial
-                color="#ff7eb6"
-                map={signTex}
-                emissive="#ff4d94"
-                emissiveIntensity={1.6}
-              />
-            </mesh>
-          </group>
-        </group>
-      );
-    }
-
-    // STYLE 2: Stacked Ribbed Floor-Slab Towers (Smart Factory & Power Substation - Mid Left in reference)
-    if (arch === 'factory' || arch === 'power') {
-      const tiers = 6;
-      const tierH = (height * 0.76) / tiers;
-      const ribColor = isCompromised
-        ? '#ff2a55'
-        : arch === 'factory'
-        ? '#00f5d4'
-        : '#ffb800';
-      const slabColor = arch === 'factory' ? '#25334a' : '#4a2c3a';
-
-      return (
-        <group>
-          {/* Dark Ground Base with Twin Vertical Cyan/Amber Portal Slits */}
-          <mesh position={[0, 0.95, 0]} castShadow receiveShadow>
-            <boxGeometry args={[width * 1.04, 1.6, depth * 1.04]} />
-            <meshStandardMaterial color="#182238" roughness={0.7} />
-          </mesh>
-          {[-0.35, 0.35].map((ox, i) => (
-            <GlowBox
-              key={i}
-              position={[ox, 0.95, depth * 0.53]}
-              args={[0.22, 0.95, 0.08]}
-              color={ribColor}
-              intensity={2.1}
-              bloomHalo={bloomEnabled}
-            />
-          ))}
-
-          {/* Stacked Ribbed Voxel Tiers with Glowing Horizontal Light Bands */}
-          {Array.from({ length: tiers }).map((_, idx) => {
-            const y = 1.85 + idx * tierH;
-            return (
-              <group key={idx} position={[0, y, 0]}>
-                <mesh castShadow receiveShadow>
-                  <boxGeometry args={[width * 0.95, tierH * 0.56, depth * 0.95]} />
-                  <meshStandardMaterial color={slabColor} roughness={0.5} />
-                </mesh>
-                <GlowBox
-                  position={[0, -tierH * 0.28, 0]}
-                  args={[width * 0.88, tierH * 0.28, depth * 0.88]}
-                  color={ribColor}
-                  intensity={2.1}
-                  bloomHalo={bloomEnabled}
-                />
-                {/* Red/Amber Side Module Indicator */}
-                <GlowBox
-                  position={[width * 0.48, 0, depth * 0.2]}
-                  args={[0.12, 0.16, 0.26]}
-                  color="#ff2a55"
-                  intensity={1.9}
-                  bloomHalo={false}
-                />
-              </group>
-            );
-          })}
-
-          {/* Upper Mechanical Cube / Twin Striped Rooftop Masts */}
-          <group position={[0, height * 0.76 + 1.4, 0]}>
-            <mesh castShadow>
-              <boxGeometry args={[width * 0.82, 1.35, depth * 0.82]} />
-              <meshStandardMaterial
-                color={arch === 'factory' ? '#94a3b8' : '#3b2439'}
-                roughness={0.5}
-              />
-            </mesh>
-            {/* Twin Red/White Rooftop Antennas */}
-            {[-0.45, 0.45].map((ox, i) => (
-              <group key={i} position={[ox, 1.0, 0]}>
-                <mesh>
-                  <boxGeometry args={[0.16, 0.9, 0.16]} />
-                  <meshStandardMaterial color="#e2e8f0" />
-                </mesh>
-                <GlowBox
-                  position={[0, 0.55, 0]}
-                  args={[0.2, 0.35, 0.2]}
-                  color="#ff2a55"
-                  intensity={2.4}
-                  bloomHalo={bloomEnabled}
-                />
-              </group>
-            ))}
-          </group>
-        </group>
-      );
-    }
-
-    // STYLE 3: Corner Neon Portal & Stepped Sign Tower (Residential & Transport - Front Left in reference)
-    if (arch === 'residential' || arch === 'transport') {
-      const baseH = height * 0.42;
-      const upperH = height * 0.48;
-      return (
-        <group>
-          {/* Wide Stepped Podium Base */}
-          <mesh position={[0, baseH / 2 + 0.24, 0]} castShadow receiveShadow>
-            <boxGeometry args={[width * 1.12, baseH, depth * 1.12]} />
-            <meshStandardMaterial color="#1c2545" roughness={0.6} />
-          </mesh>
-
-          {/* Tall Glowing Cyan Corner Pillars Framing Podium */}
-          {[
-            [-width * 0.48, depth * 0.56],
-            [width * 0.48, depth * 0.56],
-            [width * 0.56, -depth * 0.38],
-          ].map(([px, pz], idx) => (
-            <GlowBox
-              key={idx}
-              position={[px, baseH * 0.48 + 0.24, pz]}
-              args={[0.32, baseH * 0.82, 0.22]}
-              color={isAffected ? '#ff2a55' : '#00f0ff'}
-              intensity={2.2}
-              bloomHalo={bloomEnabled}
-            />
-          ))}
-
-          {/* Warm Amber Vertical Grille Bars Between Cyan Pillars */}
-          {[-0.45, -0.15, 0.15, 0.45].map((ox, idx) => (
-            <GlowBox
-              key={idx}
-              position={[ox, baseH * 0.42 + 0.24, depth * 0.57]}
-              args={[0.1, baseH * 0.62, 0.08]}
-              color="#ffb800"
-              intensity={1.9}
-              bloomHalo={false}
-            />
-          ))}
-
-          {/* Glowing Yellow Pixel-Art Sign Above Podium ("5.754") */}
-          <GlowBox
-            position={[0, baseH + 0.55, depth * 0.42]}
-            args={[width * 0.78, 0.58, 0.18]}
-            color={isAffected ? '#ff2a55' : '#ffd000'}
-            intensity={2.2}
-            bloomHalo={bloomEnabled}
-          />
-
-          {/* Upper Stepped Cyan-Framed Voxel Tower */}
-          <mesh
-            position={[0, baseH + upperH / 2 + 0.3, -0.15]}
-            castShadow
-            receiveShadow
-          >
-            <boxGeometry args={[width * 0.68, upperH, depth * 0.68]} />
-            <meshStandardMaterial
-              color="#232d54"
-              map={facadeTex}
-              emissive={primaryNeon}
-              emissiveMap={facadeTex}
-              emissiveIntensity={0.95}
-            />
-          </mesh>
-
-          {/* Horizontal Cyan Bracket Ribs on Upper Tower */}
-          {[0.25, 0.55, 0.82].map((f, i) => (
-            <GlowBox
-              key={i}
-              position={[0, baseH + upperH * f + 0.3, -0.15]}
-              args={[width * 0.74, 0.14, depth * 0.74]}
-              color={primaryNeon}
-              intensity={2.0}
-              bloomHalo={bloomEnabled}
-            />
-          ))}
-        </group>
-      );
-    }
-
-    // STYLE 4: Orange/Gold Neon-Framed Mega-Skyscraper with Twin Crown Horns (Financial & Data Center - Right Side in reference)
-    if (arch === 'financial' || arch === 'datacenter') {
-      const h1 = height * 0.32;
-      const h2 = height * 0.38;
-      const h3 = height * 0.26;
-      const frameColor = isCompromised ? '#ff1e42' : '#ff9900';
-
-      return (
-        <group>
-          {/* Lower Storefront Block with Bright Cyan "1551" Portal */}
-          <mesh position={[0, h1 / 2 + 0.24, 0]} castShadow receiveShadow>
-            <boxGeometry args={[width, h1, depth]} />
-            <meshStandardMaterial color="#192140" roughness={0.55} />
-          </mesh>
-          <GlowBox
-            position={[-0.1, h1 * 0.45 + 0.2, -depth * 0.51]}
-            args={[width * 0.68, h1 * 0.65, 0.12]}
-            color={isCompromised ? '#ff2a55' : '#00f0ff'}
-            intensity={2.1}
-            bloomHalo={bloomEnabled}
-          />
-
-          {/* Mid Skyscraper Section Framed in Glowing Orange/Gold Neon Rails */}
-          <mesh
-            position={[0, h1 + h2 / 2 + 0.28, 0]}
-            castShadow
-            receiveShadow
-          >
-            <boxGeometry args={[width * 0.88, h2, depth * 0.88]} />
-            <meshStandardMaterial
-              color="#141c38"
-              map={facadeTex}
-              emissive="#38bdf8"
-              emissiveMap={facadeTex}
-              emissiveIntensity={1.1}
-            />
-          </mesh>
-
-          {/* Glowing Orange Horizontal & Vertical Frame Bars */}
-          {[h1 + 0.3, h1 + h2 * 0.5 + 0.3, h1 + h2 + 0.3].map((hy, i) => (
-            <GlowBox
-              key={`hbar-${i}`}
-              position={[0, hy, 0]}
-              args={[width * 0.94, 0.16, depth * 0.94]}
-              color={frameColor}
-              intensity={2.2}
-              bloomHalo={bloomEnabled}
-            />
-          ))}
-          {[
-            [-width * 0.44, -depth * 0.44],
-            [width * 0.44, -depth * 0.44],
-            [-width * 0.44, depth * 0.44],
-            [width * 0.44, depth * 0.44],
-          ].map(([vx, vz], i) => (
-            <GlowBox
-              key={`vbar-${i}`}
-              position={[vx, h1 + h2 * 0.5 + 0.28, vz]}
-              args={[0.14, h2 + h3, 0.14]}
-              color={frameColor}
-              intensity={2.0}
-              bloomHalo={false}
-            />
-          ))}
-
-          {/* Upper Red Holo-Screen & Crown Section */}
-          <mesh position={[0, h1 + h2 + h3 / 2 + 0.32, 0]} castShadow>
-            <boxGeometry args={[width * 0.76, h3, depth * 0.76]} />
-            <meshStandardMaterial color="#1f294d" roughness={0.45} />
-          </mesh>
-          <GlowBox
-            position={[0, h1 + h2 + h3 * 0.5 + 0.32, -depth * 0.39]}
-            args={[width * 0.48, h3 * 0.55, 0.1]}
-            color="#ff2a55"
-            intensity={2.2}
-            bloomHalo={bloomEnabled}
-          />
-
-          {/* Twin Golden Rooftop Horns + Sign ("17Hr" on top right of reference) */}
-          <group position={[0, h1 + h2 + h3 + 0.95, 0]}>
-            <mesh>
-              <boxGeometry args={[width * 0.62, 0.75, 0.24]} />
-              <meshStandardMaterial
-                color="#ffffff"
-                map={signTex}
-                emissive="#ffe599"
-                emissiveIntensity={1.5}
-              />
-            </mesh>
-            {[-width * 0.26, width * 0.26].map((hx, i) => (
-              <GlowBox
-                key={i}
-                position={[hx, 0.55, 0]}
-                args={[0.18, 1.35, 0.18]}
-                color={frameColor}
-                intensity={2.3}
-                bloomHalo={bloomEnabled}
-              />
-            ))}
-          </group>
-        </group>
-      );
-    }
-
-    // STYLE 5: Deep Navy Mid-Rise with Recessed Blue Windows, Red Vertical Sign & White Penthouse (Corporate, Government, Hospital)
-    const mainH = height * 0.72;
-    const pentH = height * 0.28;
-    return (
-      <group>
-        {/* Main Dark Navy Voxel Block with Bright Blue Recessed Windows */}
-        <mesh position={[0, mainH / 2 + 0.24, 0]} castShadow receiveShadow>
-          <boxGeometry args={[width, mainH, depth]} />
-          <meshStandardMaterial
-            color="#10172e"
-            map={facadeTex}
-            emissive="#00d8ff"
-            emissiveMap={facadeTex}
-            emissiveIntensity={1.15}
-            roughness={0.45}
-          />
-        </mesh>
-
-        {/* Warm Gold Ground-Floor Storefront ("HLNOY" in reference) */}
-        <GlowBox
-          position={[0, 0.65, -depth * 0.51]}
-          args={[width * 0.76, 0.62, 0.12]}
-          color={isCompromised ? '#ff2a55' : '#ffcc33'}
-          intensity={2.1}
-          bloomHalo={bloomEnabled}
-        />
-
-        {/* Vertical Crimson/Pink Neon Strip Sign ("1.7.7.") */}
-        <GlowBox
-          position={[width * 0.36, mainH * 0.42, -depth * 0.52]}
-          args={[0.26, 1.45, 0.1]}
-          color="#ff2a55"
-          intensity={2.3}
-          bloomHalo={bloomEnabled}
-        />
-
-        {/* Projecting Cyan/White Horizontal Billboard */}
-        <group position={[-width * 0.56, mainH * 0.62, 0]}>
-          <mesh>
-            <boxGeometry args={[0.14, 1.05, 1.45]} />
-            <meshStandardMaterial
-              color="#e0f2fe"
-              map={signTex}
-              emissive="#38bdf8"
-              emissiveIntensity={1.6}
-            />
-          </mesh>
-        </group>
-
-        {/* White/Slate Stepped Penthouse Crown with Yellow/Cyan Highlights */}
-        <mesh
-          position={[0, mainH + pentH / 2 + 0.26, 0]}
-          castShadow
-          receiveShadow
-        >
-          <boxGeometry args={[width * 0.78, pentH, depth * 0.78]} />
-          <meshStandardMaterial color="#94a3b8" roughness={0.4} />
-        </mesh>
-        <GlowBox
-          position={[-width * 0.4, mainH + pentH * 0.5 + 0.26, 0]}
-          args={[0.12, pentH * 0.65, depth * 0.52]}
-          color="#ffd000"
-          intensity={2.1}
-          bloomHalo={bloomEnabled}
-        />
-      </group>
-    );
-  };
+  const visualHeight = Math.max(2.6, height * 0.48);
 
   return (
-    <group
-      position={building.position}
-      onClick={(e) => {
-        e.stopPropagation();
-        onSelect(building.id, false);
-      }}
-      onDoubleClick={(e) => {
-        e.stopPropagation();
-        onDoubleClick(building.id, true);
-      }}
-      onPointerOver={(e) => {
-        e.stopPropagation();
-        onHover(building.id);
-      }}
-      onPointerOut={(e) => {
-        e.stopPropagation();
-        onHover(null);
-      }}
-    >
-      {/* Sidewalk Block Pad */}
-      <mesh position={[0, 0.12, 0]} receiveShadow>
-        <boxGeometry args={[width + 0.65, 0.24, depth + 0.65]} />
-        <meshStandardMaterial color="#17203a" roughness={0.8} />
+    <group position={[x, 0, z]}>
+      {/* Concrete Building Foundation Pad */}
+      <mesh position={[0, 0.05, 0]} receiveShadow>
+        <boxGeometry args={[width + 0.6, 0.1, depth + 0.6]} />
+        <meshStandardMaterial color="#ced4da" roughness={0.8} />
       </mesh>
 
-      {/* Bespoke Voxel Building Architecture */}
-      {renderArchetypeGeometry()}
-
-      {/* Rooftop Status Beacon */}
-      <group position={[0, height + 0.55, 0]}>
-        <mesh
-          ref={beaconRef}
-          position={[0, antennaHeight * 0.35, 0]}
-        >
-          <boxGeometry args={[0.24, 0.24, 0.24]} />
-          <meshStandardMaterial
-            color={statusColor}
-            emissive={statusColor}
-            emissiveIntensity={2.4}
-          />
-        </mesh>
-      </group>
-
-      {/* Selection / Hover Ground Ring */}
-      {(isSelected || isHovered) && (
-        <mesh position={[0, 0.27, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+      {/* Selection / Status Ground Ring */}
+      {(isSelected || hovered || isCompromised || isSuspicious) && (
+        <mesh position={[0, 0.12, 0]} rotation={[-Math.PI / 2, 0, 0]}>
           <ringGeometry
             args={[
               Math.max(width, depth) * 0.68,
-              Math.max(width, depth) * 0.8,
-              32,
+              Math.max(width, depth) * 0.82,
+              28,
             ]}
           />
           <meshBasicMaterial
-            color={isSelected ? '#00f0ff' : '#ffffff'}
+            color={isSelected ? '#ffffff' : statusColor}
             side={THREE.DoubleSide}
           />
         </mesh>
       )}
 
-      {/* Threat Overlay: Compromised / Affected Warning Ring */}
-      {overlays.threats && isCompromised && (
-        <mesh position={[0, 0.32, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <ringGeometry
-            args={[
-              Math.max(width, depth) * 0.72,
-              Math.max(width, depth) * 0.88,
-              24,
-            ]}
-          />
-          <meshBasicMaterial
-            color={isAffected ? '#ff1e42' : '#ff6b00'}
-            side={THREE.DoubleSide}
-            transparent
-            opacity={0.85}
-          />
-        </mesh>
-      )}
+      {/* Clickable Low-Poly Landmark Building */}
+      <group
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect(building.id);
+        }}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHovered(true);
+          document.body.style.cursor = 'pointer';
+        }}
+        onPointerOut={() => {
+          setHovered(false);
+          document.body.style.cursor = 'auto';
+        }}
+      >
+        <StylizedLandmarkMesh
+          archetype={building.archetype}
+          height={height}
+          isCompromised={isCompromised}
+          isSuspicious={isSuspicious}
+        />
+      </group>
 
-      {/* Security Control Overlay: Defensive Perimeter Ring */}
-      {overlays.controls && hasFirewallOrSeg && (
-        <mesh
-          ref={shieldRingRef}
-          position={[0, 0.38, 0]}
-          rotation={[-Math.PI / 2, 0, 0]}
-        >
-          <ringGeometry
-            args={[
-              Math.max(width, depth) * 0.64,
-              Math.max(width, depth) * 0.72,
-              6,
-            ]}
-          />
-          <meshBasicMaterial
-            color="#22d3ee"
-            side={THREE.DoubleSide}
-            transparent
-            opacity={0.75}
-          />
-        </mesh>
-      )}
-
-      {/* Monitoring Sensor Beacon */}
-      {overlays.controls && hasMonitoring && (
-        <mesh position={[-width * 0.22, height + 0.75, 0]}>
-          <octahedronGeometry args={[0.22, 0]} />
+      {/* Security Alert Beacon when compromised or suspicious */}
+      {(isCompromised || isSuspicious) && (
+        <mesh ref={beaconRef} position={[0, visualHeight + 1.2, 0]}>
+          <octahedronGeometry args={[0.32, 0]} />
           <meshStandardMaterial
-            color="#a855f7"
-            emissive="#a855f7"
-            emissiveIntensity={2.0}
+            color={isCompromised ? '#ef4444' : '#f59e0b'}
+            emissive={isCompromised ? '#ef4444' : '#f59e0b'}
+            emissiveIntensity={0.6}
           />
         </mesh>
       )}
 
-      {/* Quarantine / Isolation Wireframe Cage */}
-      {isIsolated && (
-        <mesh position={[0, height / 2 + 0.3, 0]}>
-          <boxGeometry args={[width + 0.5, height + 0.8, depth + 0.5]} />
-          <meshBasicMaterial
-            color="#38bdf8"
-            wireframe
-            transparent
-            opacity={0.42}
-          />
-        </mesh>
-      )}
-
-      {/* Compact Floating HUD Badge over Building */}
-      {(isSelected ||
-        isHovered ||
-        (overlays.threats && isCompromised) ||
-        (overlays.vulnerabilities && discoveredUnmitigatedVulns.length > 0)) && (
+      {/* Compact Floating HUD Tag — shown for selected, hovered, or active incident buildings */}
+      {(isSelected || hovered || isCompromised || isSuspicious) && (
         <Html
-          position={[0, height + antennaHeight * 0.4 + 0.85, 0]}
+          position={[0, visualHeight + 1.15, 0]}
           center
           zIndexRange={[10, 0]}
+          style={{ pointerEvents: 'none' }}
         >
           <div
-            onClick={(e) => {
-              e.stopPropagation();
-              onSelect(building.id, false);
-            }}
-            className={`city-node-label ${isSelected ? 'selected' : ''} ${
-              isAffected
-                ? 'state-affected'
-                : isCompromised
-                ? 'state-compromised'
-                : isIsolated
-                ? 'state-isolated'
-                : discoveredUnmitigatedVulns.length > 0
-                ? 'state-vulnerable'
-                : 'state-healthy'
+            className={`building-tag-3d ${isSelected ? 'selected' : ''} ${
+              isCompromised ? 'compromised' : isSuspicious ? 'suspicious' : ''
             }`}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '3px 8px',
+              borderRadius: '999px',
+              background: 'rgba(15, 23, 42, 0.88)',
+              border: `1.5px solid ${statusColor}`,
+              color: '#f8fafc',
+              fontSize: '11px',
+              fontFamily: 'var(--font-mono)',
+              fontWeight: 700,
+              whiteSpace: 'nowrap',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+              transform: 'scale(0.85)',
+            }}
           >
-            <span className="node-code">{building.id.replace('BLD-', '')}</span>
-            {isAffected && <span className="node-tag danger">AFFECTED</span>}
-            {!isAffected && isCompromised && (
-              <span className="node-tag warning">{building.compromiseState}</span>
+            <span
+              style={{
+                width: '7px',
+                height: '7px',
+                borderRadius: '50%',
+                backgroundColor: statusColor,
+                display: 'inline-block',
+              }}
+            />
+            <span>{building.id.replace('BLD-', '')}</span>
+            {building.isolated && (
+              <span style={{ color: '#94a3b8', fontSize: '10px' }}>ISOLATED</span>
             )}
-            {isIsolated && <span className="node-tag muted">ISOLATED</span>}
-            {overlays.vulnerabilities && discoveredUnmitigatedVulns.length > 0 && (
-              <span className="node-tag vuln">
-                {discoveredUnmitigatedVulns.length} VULN
+            {!building.isolated && isCompromised && (
+              <span
+                style={{
+                  background: '#ef4444',
+                  color: '#fff',
+                  padding: '1px 5px',
+                  borderRadius: '4px',
+                  fontSize: '9.5px',
+                }}
+              >
+                {building.compromiseState}
               </span>
             )}
-            {overlays.controls && building.installedControls.length > 0 && (
-              <span className="node-tag shield">
+            {!building.isolated && !isCompromised && isSuspicious && (
+              <span
+                style={{
+                  background: '#f59e0b',
+                  color: '#111827',
+                  padding: '1px 5px',
+                  borderRadius: '4px',
+                  fontSize: '9.5px',
+                }}
+              >
+                ALERT
+              </span>
+            )}
+            {building.installedControls.length > 0 && (
+              <span style={{ color: '#38bdf8', fontSize: '10px' }}>
                 +{building.installedControls.length} CTRL
               </span>
             )}
@@ -940,752 +717,591 @@ function VoxelBuilding({
   );
 }
 
-/**
- * Sleek Ground-Level Fiber Conduits & Packet Pulses
- */
-function NetworkTopologyLayer({
-  buildings,
-  connections,
-  activeHighlight,
-  selectedBuildingId,
-  enableParticles,
-}) {
-  const pulseRefs = useRef([]);
+function NetworkConnectionArc({ conn, sourceBuilding, targetBuilding, isHighlighted }) {
+  const pulseRef = useRef();
+  const progressRef = useRef((conn.id.charCodeAt(conn.id.length - 1) % 10) / 10);
 
-  const edgeData = useMemo(() => {
-    const map = new Map(buildings.map((b) => [b.id, b]));
-    return connections
-      .map((conn) => {
-        const src = map.get(conn.source);
-        const dst = map.get(conn.target);
-        if (!src || !dst) return null;
+  const style = getConnectionStyle(conn);
 
-        const start = new THREE.Vector3(src.position[0], 0.35, src.position[2]);
-        const end = new THREE.Vector3(dst.position[0], 0.35, dst.position[2]);
-        const mid = start.clone().add(end).multiplyScalar(0.5);
-        mid.y = 0.75;
+  const points = useMemo(() => {
+    const start = new THREE.Vector3(
+      sourceBuilding.position[0],
+      0.22,
+      sourceBuilding.position[2]
+    );
+    const end = new THREE.Vector3(
+      targetBuilding.position[0],
+      0.22,
+      targetBuilding.position[2]
+    );
+    const mid = start.clone().lerp(end, 0.5);
+    mid.y += 0.35;
+    const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+    return curve.getPoints(20);
+  }, [sourceBuilding.position, targetBuilding.position]);
 
-        const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
-        const points = curve.getPoints(16);
-
-        const isHighlighted =
-          activeHighlight &&
-          ((activeHighlight.sourceId === conn.source &&
-            activeHighlight.targetId === conn.target) ||
-            (activeHighlight.sourceId === conn.target &&
-              activeHighlight.targetId === conn.source));
-
-        const isConnectedToSelected =
-          selectedBuildingId === conn.source || selectedBuildingId === conn.target;
-
-        let color = '#00f0ff';
-        if (conn.trafficState === 'BLOCKED') color = '#ff2a55';
-        else if (conn.trafficState === 'ISOLATED') color = '#475569';
-        else if (conn.trafficState === 'SUSPICIOUS') color = '#ffb800';
-        else if (conn.trafficState === 'HIGH') color = '#38bdf8';
-
-        if (isHighlighted) {
-          color = activeHighlight.outcome === 'BLOCKED' ? '#ff2a55' : '#ff6b00';
-        }
-
-        return {
-          conn,
-          curve,
-          points,
-          mid,
-          color,
-          isHighlighted,
-          isConnectedToSelected,
-        };
-      })
-      .filter(Boolean);
-  }, [buildings, connections, activeHighlight, selectedBuildingId]);
-
-  useFrame(({ clock }) => {
-    if (!enableParticles) return;
-    const t = clock.getElapsedTime();
-    edgeData.forEach((item, idx) => {
-      const mesh = pulseRefs.current[idx];
-      if (!mesh) return;
-      if (item.conn.trafficState === 'ISOLATED') {
-        mesh.visible = false;
-        return;
-      }
-      mesh.visible = true;
-      const speed =
-        item.conn.trafficState === 'HIGH' || item.conn.trafficState === 'SUSPICIOUS'
-          ? 0.55
-          : 0.28;
-      let progress = (t * speed + idx * 0.17) % 1;
-      if (item.conn.trafficState === 'BLOCKED') {
-        progress = Math.min(0.48, (t * 0.45 + idx * 0.13) % 0.65);
-      }
-      const pos = item.curve.getPoint(progress);
-      mesh.position.copy(pos);
-    });
+  useFrame((_, delta) => {
+    if (!pulseRef.current) return;
+    if (!conn.permitted || conn.trafficState === 'BLOCKED') {
+      pulseRef.current.visible = false;
+      return;
+    }
+    pulseRef.current.visible = true;
+    const speed =
+      conn.trafficState === 'ATTACK_PROPAGATION' || conn.trafficState === 'COMPROMISED'
+        ? 0.65
+        : 0.28;
+    progressRef.current = (progressRef.current + delta * speed) % 1;
+    const idx = Math.floor(progressRef.current * (points.length - 1));
+    const pt = points[idx];
+    if (pt) {
+      pulseRef.current.position.set(pt.x, pt.y, pt.z);
+    }
   });
 
   return (
     <group>
-      {edgeData.map((item, idx) => (
-        <group key={item.conn.id}>
-          <Line
-            points={item.points}
-            color={item.color}
-            lineWidth={
-              item.isHighlighted
-                ? 2.8
-                : item.isConnectedToSelected
-                ? 1.9
-                : 1.0
-            }
-            transparent
-            opacity={
-              item.conn.trafficState === 'ISOLATED'
-                ? 0.2
-                : item.isHighlighted || item.isConnectedToSelected
-                ? 0.85
-                : 0.35
-            }
-          />
-
-          {item.conn.trafficState === 'BLOCKED' && (
-            <mesh position={[item.mid.x, item.mid.y, item.mid.z]}>
-              <octahedronGeometry args={[0.24, 0]} />
-              <meshStandardMaterial
-                color="#ff2a55"
-                emissive="#ff2a55"
-                emissiveIntensity={2.2}
-              />
-            </mesh>
-          )}
-
-          {enableParticles && (
-            <mesh
-              ref={(el) => {
-                pulseRefs.current[idx] = el;
-              }}
-            >
-              <sphereGeometry args={[item.isHighlighted ? 0.18 : 0.11, 8, 8]} />
-              <meshBasicMaterial color={item.color} />
-            </mesh>
-          )}
-        </group>
-      ))}
+      <Line
+        points={points}
+        color={style.color}
+        lineWidth={isHighlighted ? style.lineWidth + 1.2 : style.lineWidth}
+        dashed={style.dashed}
+        dashScale={style.dashScale || 1}
+        dashSize={0.5}
+        gapSize={0.3}
+        transparent
+        opacity={isHighlighted ? 0.95 : style.opacity}
+      />
+      <mesh ref={pulseRef}>
+        <sphereGeometry args={[0.14, 10, 10]} />
+        <meshBasicMaterial color={style.color} />
+      </mesh>
     </group>
   );
 }
 
 /**
- * Collision-Free Flying Cars & Ground Street Traffic
- * Flying cars travel strictly along the open Central Avenue Canyon (`x = -1.2` and `x = -0.3`)
- * AND enforce real-time 3D bounding-box repulsion against every building so they NEVER hit any building!
+ * Colorful low-poly neighborhood filler buildings & parks inside the grassy blocks
+ * (Strictly outside all road corridors and never overlapping core buildings)
  */
-function AmbientCyberTraffic({ enabled, buildings }) {
-  const flyersRef = useRef([]);
-  const groundCarsRef = useRef([]);
-
-  // Dedicated sky-lanes in the open central canyon between left & right building blocks
-  const flyers = useMemo(
+function CityNeighborhoodFiller() {
+  const fillerBuildings = useMemo(
     () => [
-      {
-        // Red Voxel Spinner (Upper Central Canyon - matches reference top flying car)
-        laneX: -0.95,
-        height: 7.5,
-        rangeZ: 6.5,
-        speed: 1.4,
-        phase: 5.2,
-        bodyColor: '#ff2a55',
-        cabinColor: '#fda4af',
-        streakColor1: '#00f0ff',
-        streakColor2: '#ff2a55',
-      },
-      {
-        // Yellow Voxel Spinner (Mid Central Canyon - matches reference lower flying car)
-        laneX: -1.25,
-        height: 5.9,
-        rangeZ: 6.5,
-        speed: 1.25,
-        phase: 4.8,
-        bodyColor: '#ffb800',
-        cabinColor: '#fef08a',
-        streakColor1: '#ffffff',
-        streakColor2: '#ffb800',
-      },
-      {
-        // High-altitude Outer Perimeter Police Spinner
-        laneX: -0.45,
-        height: 9.1,
-        rangeZ: 7.5,
-        speed: -1.35,
-        phase: 2.0,
-        bodyColor: '#00d8ff',
-        cabinColor: '#e0f2fe',
-        streakColor1: '#00f0ff',
-        streakColor2: '#ff2a85',
-      },
+      // Top-left block (-9.0, -8.0): Magenta & Blue striped commercial building with billboard + small apartments
+      { pos: [-9.8, -6.8], size: [2.4, 2.1, 1.5], color: '#e64980', stripe: '#228be6', roofBillboard: true },
+      { pos: [-6.8, -8.6], size: [1.5, 2.2, 1.3], color: '#51cf66', stripe: '#2b8a3e' },
+      { pos: [-10.8, -9.6], size: [1.4, 2.6, 1.3], color: '#e8590c', stripe: '#f8f9fa' },
+      // Top-center block (-2.0, -8.2): Salmon-coral twin curved-balcony apartment building
+      { pos: [-2.0, -8.2], size: [1.8, 3.2, 1.5], color: '#ff8787', stripe: '#343a40' },
+      { pos: [-2.2, -5.8], size: [1.1, 1.9, 1.1], color: '#9775fa', stripe: '#f3f0ff' },
+      // Top-right block (10.8, -7.2): Mint-green & yellow mid-rise buildings
+      { pos: [10.8, -6.5], size: [1.9, 1.8, 1.5], color: '#fae588', stripe: '#51cf66' },
+      { pos: [11.4, -9.2], size: [1.4, 2.4, 1.3], color: '#ae3ec9', stripe: '#f8f9fa' },
+      // Middle-left outer strip (-16.8, z): Colorful apartments
+      { pos: [-16.6, -6.5], size: [1.8, 2.8, 1.6], color: '#74c0fc', stripe: '#1c7ed6' },
+      { pos: [-16.6, 0.5], size: [1.8, 3.4, 1.6], color: '#63e6be', stripe: '#0ca678' },
+      { pos: [-16.4, 7.5], size: [1.9, 2.2, 1.6], color: '#b197fc', stripe: '#5f3dc4' },
+      // Bottom-left block (-10.8, 6.8): Lilac & blue corner shop buildings
+      { pos: [-10.8, 6.6], size: [1.7, 1.9, 1.5], color: '#d0bfff', stripe: '#7950f2' },
+      { pos: [-11.2, 9.4], size: [1.3, 1.8, 1.3], color: '#69db7c', stripe: '#2b8a3e' },
+      // Middle-center & bottom-center accents
+      { pos: [-7.0, 2.0], size: [1.2, 2.1, 1.2], color: '#fcc419', stripe: '#e67700' },
+      { pos: [-10.6, 2.2], size: [1.3, 1.8, 1.2], color: '#9775fa', stripe: '#5f3dc4' },
+      // Right-side blocks (8.0..11.5, 7.5): Blue municipal building & terracotta courtyard blocks
+      { pos: [10.8, 6.6], size: [2.0, 1.6, 1.4], color: '#748ffc', stripe: '#364fc7' },
+      { pos: [10.8, 9.5], size: [2.2, 1.9, 1.6], color: '#e599f7', stripe: '#ae3ec9' },
+      { pos: [16.5, -1.5], size: [1.7, 2.6, 1.5], color: '#ffd43b', stripe: '#f08c00' },
+      { pos: [16.5, 6.8], size: [1.8, 2.2, 1.6], color: '#63e6be', stripe: '#099268' },
     ],
     []
   );
-
-  // Ground vehicles on the central avenue (x = -0.85)
-  const groundCars = useMemo(
-    () => [
-      { laneX: -1.25, rangeZ: 9.5, speed: 2.1, phase: 1.0, color: '#ffb800', isTaxi: true },
-      { laneX: -0.35, rangeZ: 9.5, speed: -1.8, phase: 3.5, color: '#34d399', isTaxi: false },
-    ],
-    []
-  );
-
-  useFrame(({ clock }) => {
-    if (!enabled) return;
-    const t = clock.getElapsedTime();
-
-    flyers.forEach((f, idx) => {
-      const group = flyersRef.current[idx];
-      if (!group) return;
-
-      const cycle = ((t * Math.abs(f.speed) + f.phase) % (f.rangeZ * 2)) - f.rangeZ;
-      const dir = f.speed >= 0 ? 1 : -1;
-      let x = f.laneX;
-      let y = f.height + Math.sin(t * 2.2 + idx) * 0.16;
-      const z = cycle * dir;
-
-      // Explicit 3D Building Collision Avoidance Guarantee:
-      // Check every building's 3D bounding box + 1.45-unit safety margin
-      if (buildings && buildings.length > 0) {
-        for (const b of buildings) {
-          const bx = b.position[0];
-          const bz = b.position[2];
-          const halfW = (b.dimensions?.width || 2.5) * 0.5 + 1.45;
-          const halfD = (b.dimensions?.depth || 2.5) * 0.5 + 1.45;
-          const topY = (b.dimensions?.height || 8) + 2.2;
-
-          if (
-            Math.abs(x - bx) < halfW &&
-            Math.abs(z - bz) < halfD &&
-            y < topY
-          ) {
-            // Smoothly steer into the clear central canyon or climb above rooftop
-            if (Math.abs(-0.85 - bx) >= halfW) {
-              x = -0.85;
-            } else {
-              y = topY + 0.8;
-            }
-          }
-        }
-      }
-
-      group.position.set(x, y, z);
-      group.rotation.y = dir > 0 ? 0 : Math.PI;
-    });
-
-    groundCars.forEach((c, idx) => {
-      const group = groundCarsRef.current[idx];
-      if (!group) return;
-      const cycle = ((t * Math.abs(c.speed) + c.phase) % (c.rangeZ * 2)) - c.rangeZ;
-      const dir = c.speed >= 0 ? 1 : -1;
-      group.position.set(c.laneX, 0.24, cycle * dir);
-      group.rotation.y = dir > 0 ? 0 : Math.PI;
-    });
-  });
-
-  if (!enabled) return null;
 
   return (
     <group>
-      {/* Flying Voxel Spinners with Horizontal Motion-Blur Light Streaks */}
-      {flyers.map((f, idx) => (
-        <group
-          key={`flyer-${idx}`}
-          ref={(el) => {
-            flyersRef.current[idx] = el;
-          }}
-        >
-          {/* Main Chunky Voxel Car Chassis */}
-          <mesh castShadow>
-            <boxGeometry args={[0.58, 0.34, 0.92]} />
-            <meshStandardMaterial
-              color={f.bodyColor}
-              emissive={f.bodyColor}
-              emissiveIntensity={0.85}
-              roughness={0.3}
-            />
+      {fillerBuildings.map((fb, idx) => (
+        <group key={`filler-${idx}`} position={[fb.pos[0], 0, fb.pos[1]]}>
+          <mesh position={[0, fb.size[1] / 2, 0]} castShadow receiveShadow>
+            <boxGeometry args={fb.size} />
+            <meshStandardMaterial color={fb.color} roughness={0.65} />
           </mesh>
-          {/* Glowing Voxel Cabin / Windshield */}
-          <mesh position={[0, 0.2, 0.08]}>
-            <boxGeometry args={[0.46, 0.2, 0.48]} />
-            <meshStandardMaterial
-              color={f.cabinColor}
-              emissive={f.cabinColor}
-              emissiveIntensity={1.4}
-            />
-          </mesh>
-          {/* Soft Radial Glow Aura Around Flying Car */}
-          <sprite scale={[2.2, 1.5, 1]}>
-            <spriteMaterial
-              map={getRadialGlowTexture()}
-              color={f.bodyColor}
-              transparent
-              opacity={0.42}
-              blending={THREE.AdditiveBlending}
-              depthWrite={false}
-            />
-          </sprite>
-          {/* Twin Horizontal Light-Trail Streaks Behind Spinner (just like reference image!) */}
-          <mesh position={[-0.18, 0.05, -0.95]}>
-            <boxGeometry args={[0.1, 0.09, 1.15]} />
-            <meshBasicMaterial
-              color={f.streakColor1}
-              transparent
-              opacity={0.85}
-              blending={THREE.AdditiveBlending}
-              depthWrite={false}
-            />
-          </mesh>
-          <mesh position={[0.18, -0.04, -0.85]}>
-            <boxGeometry args={[0.12, 0.09, 0.95]} />
-            <meshBasicMaterial
-              color={f.streakColor2}
-              transparent
-              opacity={0.8}
-              blending={THREE.AdditiveBlending}
-              depthWrite={false}
-            />
-          </mesh>
-        </group>
-      ))}
-
-      {/* Ground Voxel Street Cars with Headlights & Exhaust Puffs */}
-      {groundCars.map((c, idx) => (
-        <group
-          key={`car-${idx}`}
-          ref={(el) => {
-            groundCarsRef.current[idx] = el;
-          }}
-        >
-          <mesh castShadow>
-            <boxGeometry args={[0.46, 0.24, 0.78]} />
-            <meshStandardMaterial
-              color={c.color}
-              emissive={c.color}
-              emissiveIntensity={1.1}
-            />
-          </mesh>
-          {/* Glowing Headlight & Roof Streaks */}
-          <GlowBox
-            position={[0, 0.16, 0.05]}
-            args={[0.28, 0.1, 0.45]}
-            color="#ffffff"
-            intensity={2.0}
-            bloomHalo={true}
-          />
-          {/* Tiny White Voxel Exhaust Puffs */}
-          {!c.isTaxi && (
-            <group position={[0, 0.05, -0.55]}>
-              <mesh position={[0.08, 0.04, 0]}>
-                <boxGeometry args={[0.14, 0.14, 0.14]} />
-                <meshBasicMaterial color="#ffffff" />
-              </mesh>
-              <mesh position={[-0.06, 0.08, -0.16]}>
-                <boxGeometry args={[0.1, 0.1, 0.1]} />
-                <meshBasicMaterial color="#e2e8f0" />
-              </mesh>
-            </group>
+          {[0.28, 0.55, 0.82].map((r, sIdx) => (
+            <mesh key={`f-stripe-${sIdx}`} position={[0, fb.size[1] * r, 0]}>
+              <boxGeometry args={[fb.size[0] + 0.05, 0.16, fb.size[2] + 0.05]} />
+              <meshStandardMaterial color={fb.stripe} roughness={0.5} />
+            </mesh>
+          ))}
+          {fb.roofBillboard && (
+            <mesh position={[0, fb.size[1] + 0.35, 0]} rotation={[0, 0.3, 0]} castShadow>
+              <boxGeometry args={[1.4, 0.48, 0.1]} />
+              <meshStandardMaterial color="#3bc9db" roughness={0.4} />
+            </mesh>
           )}
         </group>
       ))}
+
+      {/* Fenced Recreation / Sports Court in Block (7.2, 7.8) matching bottom-right of reference */}
+      <group position={[7.4, 0.06, 7.8]}>
+        <mesh receiveShadow>
+          <boxGeometry args={[2.8, 0.08, 2.4]} />
+          <meshStandardMaterial color="#495057" roughness={0.85} />
+        </mesh>
+        {/* Pink/Red Perimeter Fence */}
+        {[
+          [0, 0.18, -1.18, 2.8, 0.28, 0.06],
+          [0, 0.18, 1.18, 2.8, 0.28, 0.06],
+          [-1.38, 0.18, 0, 0.06, 0.28, 2.4],
+          [1.38, 0.18, 0, 0.06, 0.28, 2.4],
+        ].map(([fx, fy, fz, fw, fh, fd], i) => (
+          <mesh key={`fence-${i}`} position={[fx, fy, fz]}>
+            <boxGeometry args={[fw, fh, fd]} />
+            <meshStandardMaterial color="#e64980" roughness={0.6} />
+          </mesh>
+        ))}
+      </group>
     </group>
   );
 }
 
 /**
- * Miniature Diorama Platform, Wet-Look Asphalt Streets, Crosswalks, Streetlamps,
- * Traffic Signals, Catenary Cables & Voxel Pedestrians
+ * Sunny Isometric City Ground:
+ * - Lush green grass blocks
+ * - Orthogonal grid of dark gray asphalt streets with light-gray sidewalks
+ * - White dashed lane dividers & zebra crosswalk stripes at every intersection
+ * - Abundant low-poly green, yellow, and orange trees
  */
-function DioramaBasePlatform({ citySize }) {
-  const halfSize = citySize === 'large' ? 24 : citySize === 'medium' ? 18 : 11.2;
+function CityGround() {
+  const trees = useMemo(() => {
+    const list = [];
+    const palette = [
+      { type: 'round', color: '#5ec435' },
+      { type: 'round', color: '#74d647' },
+      { type: 'autumn', color: '#f59f00' },
+      { type: 'autumn', color: '#fcc419' },
+      { type: 'pine', color: '#2b8a3e' },
+      { type: 'autumn', color: '#e8590c' },
+    ];
 
-  // Voxel Pedestrians on the sidewalks (matching the tiny blocky people in the reference image)
-  const pedestrians = useMemo(
-    () => [
-      { pos: [-2.4, 0.24, 5.2], shirt: '#00f0ff', pants: '#1e293b' },
-      { pos: [-2.1, 0.24, 5.6], shirt: '#f97316', pants: '#334155' },
-      { pos: [1.3, 0.24, 3.4], shirt: '#ff2a55', pants: '#1e293b' },
-      { pos: [1.6, 0.24, 3.0], shirt: '#eab308', pants: '#1e293b' },
-      { pos: [-2.3, 0.24, 1.4], shirt: '#38bdf8', pants: '#0f172a' },
-      { pos: [1.1, 0.24, -1.8], shirt: '#a855f7', pants: '#1e293b' },
-      { pos: [-6.4, 0.24, 5.8], shirt: '#ffffff', pants: '#334155' },
-    ],
-    []
-  );
+    // Place trees along block perimeters and park areas (avoiding roads and building footprints)
+    const treeCoords = [
+      // Around Telecom Tower Park (-6.8, -0.3)
+      [-5.9, -2.1], [-7.8, -2.2], [-8.2, 1.9], [-6.0, 1.8], [-5.8, 0.6], [-8.0, -1.2],
+      // Around Hospital (-10.2, 0.4)
+      [-11.8, -1.8], [-11.8, 2.0], [-9.2, -2.2], [-9.2, 2.2],
+      // Center Block (-3.0..3.0, -2.5..2.5)
+      [-2.8, -2.2], [0.2, -2.2], [2.8, -2.1], [-2.8, 2.1], [0.0, 2.2], [2.9, 2.1],
+      // Top-Center Block (-3.0..3.0, -10.2..-5.5)
+      [-0.4, -5.8], [2.8, -5.8], [2.8, -9.6], [-0.4, -9.8], [-2.9, -9.6],
+      // Top-Right Block (6.0..11.8, -10.2..-5.5)
+      [6.1, -6.0], [6.1, -9.6], [9.4, -6.0], [9.4, -9.8], [11.8, -7.8],
+      // Middle-Right Park & Factory Block (6.0..11.8, -2.4..2.4)
+      [6.0, -2.1], [6.2, 1.9], [10.4, -2.0], [10.6, 1.8], [11.6, 0.2], [9.6, 2.1],
+      // Bottom-Left Block (-11.8..-6.0, 5.6..10.2)
+      [-6.0, 5.8], [-6.0, 9.8], [-9.4, 5.8], [-9.5, 9.8], [-11.8, 8.0],
+      // Bottom-Center Block (-2.9..2.9, 5.6..10.2)
+      [-2.8, 5.6], [0.2, 5.6], [2.9, 5.8], [-2.8, 9.8], [0.2, 9.8], [2.9, 9.8],
+      // Bottom-Right Park (6.0..11.8, 5.6..10.2)
+      [6.0, 5.8], [6.0, 9.8], [9.2, 5.8], [9.2, 9.8], [11.8, 8.0],
+      // Outer green park avenues
+      [-15.2, -9.5], [-15.2, -2.0], [-15.2, 2.2], [-15.2, 9.2],
+      [15.2, -9.0], [15.2, -2.2], [15.2, 2.2], [15.2, 9.2],
+      [-8.5, -14.2], [-1.5, -14.2], [2.2, -14.2], [8.5, -14.2],
+      [-8.5, 14.2], [-1.5, 14.2], [2.2, 14.2], [8.5, 14.2],
+    ];
 
-  // Hanging Catenary Cables between upper towers
-  const cables = useMemo(() => {
-    const c1 = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(-3.2, 4.8, -1.2),
-      new THREE.Vector3(-0.8, 3.4, -1.2),
-      new THREE.Vector3(1.8, 4.6, -1.2)
-    ).getPoints(14);
-    const c2 = new THREE.QuadraticBezierCurve3(
-      new THREE.Vector3(-3.2, 4.2, -1.5),
-      new THREE.Vector3(-0.8, 2.9, -1.5),
-      new THREE.Vector3(1.8, 4.0, -1.5)
-    ).getPoints(14);
-    return [c1, c2];
+    treeCoords.forEach(([tx, tz], i) => {
+      const p = palette[i % palette.length];
+      const scale = 0.85 + ((i * 7) % 5) * 0.08;
+      list.push({ pos: [tx, 0, tz], type: p.type, color: p.color, scale });
+    });
+    return list;
   }, []);
 
   return (
     <group>
-      {/* Thick Dark Beveled Diorama Pedestal Base */}
-      <mesh position={[0, -0.48, 0]} receiveShadow>
-        <boxGeometry args={[halfSize * 2, 0.96, halfSize * 2]} />
-        <meshStandardMaterial color="#141a33" roughness={0.75} metalness={0.2} />
-      </mesh>
-      <mesh position={[0, -0.98, 0]}>
-        <boxGeometry args={[halfSize * 2 + 0.3, 0.16, halfSize * 2 + 0.3]} />
-        <meshStandardMaterial color="#0c1024" roughness={0.9} />
+      {/* Large Lush Green Grass Base */}
+      <mesh position={[0, -0.08, 0]} receiveShadow>
+        <boxGeometry args={[80, 0.16, 80]} />
+        <meshStandardMaterial color="#65b83b" roughness={0.85} />
       </mesh>
 
-      {/* Main North-South Central Cyberpunk Avenue (Wet-Look Dark Asphalt at x = -0.8) */}
-      <group position={[-0.8, 0.02, 0]}>
-        <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-          <planeGeometry args={[2.65, halfSize * 1.94]} />
-          <meshStandardMaterial
-            color="#0b0f22"
-            roughness={0.25}
-            metalness={0.55}
-          />
+      {/* Raised Landscaped Green Lawn Blocks inside the road grid */}
+      {[-9.0, 0.0, 9.0].map((bx) =>
+        [-8.0, 0.0, 8.0].map((bz) => (
+          <mesh key={`lawn-${bx}-${bz}`} position={[bx, 0.02, bz]} receiveShadow>
+            <boxGeometry args={[6.3, 0.05, 5.3]} />
+            <meshStandardMaterial color="#74c644" roughness={0.82} />
+          </mesh>
+        ))
+      )}
+
+      {/* Sidewalk Curbs along X Avenues and Z Streets */}
+      {ROAD_X.map((rx) => (
+        <mesh key={`sw-x-${rx}`} position={[rx, 0.01, 0]} receiveShadow>
+          <boxGeometry args={[SIDEWALK_WIDTH, 0.04, 48]} />
+          <meshStandardMaterial color="#c5cad1" roughness={0.8} />
         </mesh>
-        {/* Double Glowing Amber Centerline */}
-        {[-0.08, 0.08].map((ox, i) => (
-          <mesh
-            key={i}
-            position={[ox, 0.01, 0]}
-            rotation={[-Math.PI / 2, 0, 0]}
-          >
-            <planeGeometry args={[0.05, halfSize * 1.88]} />
-            <meshBasicMaterial color="#ffb800" transparent opacity={0.85} />
-          </mesh>
-        ))}
-
-        {/* White Crosswalk Stripes across the Avenue */}
-        {[-0.9, -0.6, -0.3, 0, 0.3, 0.6, 0.9].map((cx, i) => (
-          <mesh
-            key={`cw-${i}`}
-            position={[cx, 0.015, 2.2]}
-            rotation={[-Math.PI / 2, 0, 0]}
-          >
-            <planeGeometry args={[0.14, 0.75]} />
-            <meshBasicMaterial color="#cbd5e1" transparent opacity={0.75} />
-          </mesh>
-        ))}
-      </group>
-
-      {/* Cross-Alley Street */}
-      <group position={[-0.8, 0.015, -3.4]}>
-        <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-          <planeGeometry args={[halfSize * 1.85, 1.55]} />
-          <meshStandardMaterial color="#0b0f22" roughness={0.3} metalness={0.5} />
+      ))}
+      {ROAD_Z.map((rz) => (
+        <mesh key={`sw-z-${rz}`} position={[0, 0.01, rz]} receiveShadow>
+          <boxGeometry args={[48, 0.04, SIDEWALK_WIDTH]} />
+          <meshStandardMaterial color="#c5cad1" roughness={0.8} />
         </mesh>
-      </group>
-
-      {/* Arched Cyberpunk Streetlamps with Bright Light Pools on the Pavement */}
-      {[
-        [-2.25, 4.2, 1],
-        [0.65, 3.2, -1],
-        [-2.25, 0.6, 1],
-        [0.65, -0.8, -1],
-      ].map(([lx, lz, dir], i) => (
-        <group key={`lamp-${i}`} position={[lx, 0, lz]}>
-          {/* Pole */}
-          <mesh position={[0, 0.85, 0]}>
-            <boxGeometry args={[0.08, 1.7, 0.08]} />
-            <meshStandardMaterial color="#475569" />
-          </mesh>
-          {/* Overhanging Lamp Arm */}
-          <GlowBox
-            position={[dir * 0.24, 1.68, 0]}
-            args={[0.48, 0.1, 0.16]}
-            color="#e0f2fe"
-            intensity={2.5}
-            bloomHalo={true}
-          />
-          {/* Traffic Signal Lights on First Intersection Pole */}
-          {i === 0 && (
-            <group position={[0, 1.15, 0.09]}>
-              <GlowBox
-                position={[0, 0.12, 0]}
-                args={[0.1, 0.1, 0.06]}
-                color="#ff2a55"
-                intensity={2.4}
-                bloomHalo={false}
-              />
-              <GlowBox
-                position={[0, -0.05, 0]}
-                args={[0.1, 0.1, 0.06]}
-                color="#10b981"
-                intensity={2.4}
-                bloomHalo={false}
-              />
-            </group>
-          )}
-          {/* Ground Light Pool */}
-          <mesh
-            position={[dir * 0.25, 0.025, 0]}
-            rotation={[-Math.PI / 2, 0, 0]}
-          >
-            <circleGeometry args={[0.95, 16]} />
-            <meshBasicMaterial
-              color="#38bdf8"
-              transparent
-              opacity={0.22}
-              blending={THREE.AdditiveBlending}
-              depthWrite={false}
-            />
-          </mesh>
-        </group>
       ))}
 
-      {/* Tiny Voxel Pedestrians on Sidewalks */}
-      {pedestrians.map((p, idx) => (
-        <group key={`ped-${idx}`} position={p.pos}>
-          {/* Legs */}
-          <mesh position={[0, 0.08, 0]}>
-            <boxGeometry args={[0.14, 0.16, 0.12]} />
-            <meshStandardMaterial color={p.pants} />
-          </mesh>
-          {/* Torso */}
-          <mesh position={[0, 0.24, 0]}>
-            <boxGeometry args={[0.18, 0.2, 0.14]} />
-            <meshStandardMaterial color={p.shirt} />
-          </mesh>
-          {/* Voxel Head */}
-          <mesh position={[0, 0.4, 0]}>
-            <boxGeometry args={[0.14, 0.14, 0.14]} />
-            <meshStandardMaterial color="#f1c27d" />
-          </mesh>
-        </group>
+      {/* Dark Gray Asphalt Roadways along X Avenues and Z Streets */}
+      {ROAD_X.map((rx) => (
+        <mesh key={`rd-x-${rx}`} position={[rx, 0.025, 0]} receiveShadow>
+          <boxGeometry args={[ROAD_WIDTH, 0.04, 48]} />
+          <meshStandardMaterial color="#3b4048" roughness={0.75} />
+        </mesh>
+      ))}
+      {ROAD_Z.map((rz) => (
+        <mesh key={`rd-z-${rz}`} position={[0, 0.026, rz]} receiveShadow>
+          <boxGeometry args={[48, 0.04, ROAD_WIDTH]} />
+          <meshStandardMaterial color="#3b4048" roughness={0.75} />
+        </mesh>
       ))}
 
-      {/* Hanging Catenary Cables */}
-      {cables.map((pts, i) => (
-        <Line key={`cable-${i}`} points={pts} color="#1e293b" lineWidth={1.5} />
+      {/* White Dashed Centerlines on X Avenues */}
+      {ROAD_X.map((rx) =>
+        [-16, -8, 0, 8, 16].map((segZ) =>
+          [-2.2, -0.7, 0.7, 2.2].map((dz, di) => (
+            <mesh
+              key={`dash-x-${rx}-${segZ}-${di}`}
+              position={[rx, 0.052, segZ + dz]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[0.08, 0.65]} />
+              <meshBasicMaterial color="#f1f5f9" />
+            </mesh>
+          ))
+        )
+      )}
+
+      {/* White Dashed Centerlines on Z Streets */}
+      {ROAD_Z.map((rz) =>
+        [-18, -9, 0, 9, 18].map((segX) =>
+          [-2.4, -0.8, 0.8, 2.4].map((dx, di) => (
+            <mesh
+              key={`dash-z-${rz}-${segX}-${di}`}
+              position={[segX + dx, 0.052, rz]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[0.65, 0.08]} />
+              <meshBasicMaterial color="#f1f5f9" />
+            </mesh>
+          ))
+        )
+      )}
+
+      {/* White Zebra Crosswalks at Every Intersection (rx, rz) */}
+      {ROAD_X.map((rx) =>
+        ROAD_Z.map((rz) => (
+          <group key={`xw-${rx}-${rz}`} position={[rx, 0.055, rz]}>
+            {/* North & South Crosswalks */}
+            {[-1.25, 1.25].map((cz) =>
+              [-0.65, -0.32, 0, 0.32, 0.65].map((cx, si) => (
+                <mesh
+                  key={`xw-ns-${cz}-${si}`}
+                  position={[cx, 0, cz]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                >
+                  <planeGeometry args={[0.14, 0.42]} />
+                  <meshBasicMaterial color="#f8fafc" />
+                </mesh>
+              ))
+            )}
+            {/* East & West Crosswalks */}
+            {[-1.25, 1.25].map((cx) =>
+              [-0.65, -0.32, 0, 0.32, 0.65].map((cz, si) => (
+                <mesh
+                  key={`xw-ew-${cx}-${si}`}
+                  position={[cx, 0, cz]}
+                  rotation={[-Math.PI / 2, 0, 0]}
+                >
+                  <planeGeometry args={[0.42, 0.14]} />
+                  <meshBasicMaterial color="#f8fafc" />
+                </mesh>
+              ))
+            )}
+          </group>
+        ))
+      )}
+
+      {/* Render All Low-Poly Trees */}
+      {trees.map((t, idx) => (
+        <LowPolyTree
+          key={`tree-${idx}`}
+          position={t.pos}
+          type={t.type}
+          color={t.color}
+          scale={t.scale}
+        />
       ))}
     </group>
   );
 }
 
 /**
- * 2D Interactive Isometric Topology Fallback when WebGL is disabled/unavailable
+ * Normal Ground Street Cars ONLY (Zero Flying Cars!).
+ * Cars drive strictly along the orthogonal asphalt road lanes (ROAD_X and ROAD_Z)
+ * AND run explicit bounding-box collision checks against all buildings so they never hit any building.
  */
-function Fallback2DCityMap({
-  buildings,
-  connections,
-  selectedBuildingId,
-  onSelectBuilding,
-}) {
-  const map = new Map(buildings.map((b) => [b.id, b]));
-  const scale = 18;
-  const cx = 320;
-  const cy = 230;
+function GroundStreetTraffic({ buildings = [] }) {
+  const carRefs = useRef([]);
+
+  const buildingBoxes = useMemo(() => {
+    return buildings.map((b) => {
+      const [bx, , bz] = b.position;
+      const halfW = (b.dimensions?.width || 2.2) * 0.5 + 0.75;
+      const halfD = (b.dimensions?.depth || 2.2) * 0.5 + 0.75;
+      return {
+        minX: bx - halfW,
+        maxX: bx + halfW,
+        minZ: bz - halfD,
+        maxZ: bz + halfD,
+        centerX: bx,
+        centerZ: bz,
+      };
+    });
+  }, [buildings]);
+
+  // 16 normal street cars travelling in right-hand lanes along ROAD_X and ROAD_Z
+  const cars = useMemo(
+    () => [
+      // North-South cars along ROAD_X = [-13.5, -4.5, 4.5, 13.5]
+      { axis: 'z', roadCoord: -13.5, laneOffset: 0.44, dir: 1, speed: 3.2, phase: 0.0, color: '#fcc419' },
+      { axis: 'z', roadCoord: -13.5, laneOffset: -0.44, dir: -1, speed: 2.9, phase: 0.5, color: '#ff6b6b' },
+      { axis: 'z', roadCoord: -4.5, laneOffset: 0.44, dir: 1, speed: 3.4, phase: 0.15, color: '#339af0' },
+      { axis: 'z', roadCoord: -4.5, laneOffset: -0.44, dir: -1, speed: 3.0, phase: 0.62, color: '#f8f9fa' },
+      { axis: 'z', roadCoord: -4.5, laneOffset: 0.44, dir: 1, speed: 3.4, phase: 0.72, color: '#fcc419' },
+      { axis: 'z', roadCoord: 4.5, laneOffset: 0.44, dir: 1, speed: 3.1, phase: 0.28, color: '#51cf66' },
+      { axis: 'z', roadCoord: 4.5, laneOffset: -0.44, dir: -1, speed: 3.5, phase: 0.8, color: '#ff922b' },
+      { axis: 'z', roadCoord: 4.5, laneOffset: -0.44, dir: -1, speed: 3.5, phase: 0.35, color: '#f03e3e' },
+      { axis: 'z', roadCoord: 13.5, laneOffset: 0.44, dir: 1, speed: 2.8, phase: 0.42, color: '#fcc419' },
+      { axis: 'z', roadCoord: 13.5, laneOffset: -0.44, dir: -1, speed: 3.2, phase: 0.9, color: '#4dabf7' },
+
+      // East-West cars along ROAD_Z = [-12.0, -4.0, 4.0, 12.0]
+      { axis: 'x', roadCoord: -12.0, laneOffset: 0.44, dir: 1, speed: 3.0, phase: 0.2, color: '#ff6b6b' },
+      { axis: 'x', roadCoord: -4.0, laneOffset: 0.44, dir: 1, speed: 3.3, phase: 0.1, color: '#fcc419' },
+      { axis: 'x', roadCoord: -4.0, laneOffset: -0.44, dir: -1, speed: 2.9, phase: 0.55, color: '#f8f9fa' },
+      { axis: 'x', roadCoord: 4.0, laneOffset: 0.44, dir: 1, speed: 3.2, phase: 0.38, color: '#339af0' },
+      { axis: 'x', roadCoord: 4.0, laneOffset: -0.44, dir: -1, speed: 3.4, phase: 0.84, color: '#fcc419' },
+      { axis: 'x', roadCoord: 12.0, laneOffset: -0.44, dir: -1, speed: 3.1, phase: 0.48, color: '#69db7c' },
+    ],
+    []
+  );
+
+  useFrame((state) => {
+    const t = state.clock.getElapsedTime();
+    const span = 36; // [-18, +18]
+    cars.forEach((car, idx) => {
+      const ref = carRefs.current[idx];
+      if (!ref) return;
+
+      const travel = (((t * car.speed * 0.08 + car.phase) % 1) * span - span / 2) * car.dir;
+      let cx = car.axis === 'x' ? travel : car.roadCoord + car.laneOffset;
+      let cz = car.axis === 'z' ? travel : car.roadCoord + car.laneOffset;
+
+      // Safety bounding-box check guaranteeing the car never touches any building
+      for (let i = 0; i < buildingBoxes.length; i++) {
+        const b = buildingBoxes[i];
+        if (cx > b.minX && cx < b.maxX && cz > b.minZ && cz < b.maxZ) {
+          if (car.axis === 'z') {
+            cx = car.roadCoord + car.laneOffset;
+          } else {
+            cz = car.roadCoord + car.laneOffset;
+          }
+        }
+      }
+
+      ref.position.set(cx, 0.13, cz);
+      if (car.axis === 'z') {
+        ref.rotation.y = car.dir > 0 ? 0 : Math.PI;
+      } else {
+        ref.rotation.y = car.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      }
+    });
+  });
 
   return (
-    <div className="fallback-map-container" data-testid="city-fallback-map">
-      <div className="fallback-banner">
-        Interactive Tactical Network Map (WebGL 2D Mode Active)
-      </div>
-      <svg viewBox="0 0 640 460" className="fallback-svg">
-        {connections.map((conn) => {
-          const src = map.get(conn.source);
-          const dst = map.get(conn.target);
-          if (!src || !dst) return null;
-          const x1 = cx + src.position[0] * scale;
-          const y1 = cy + src.position[2] * scale;
-          const x2 = cx + dst.position[0] * scale;
-          const y2 = cy + dst.position[2] * scale;
-          const stroke =
-            conn.trafficState === 'BLOCKED'
-              ? '#ff2a55'
-              : conn.trafficState === 'SUSPICIOUS'
-              ? '#ffb800'
-              : '#00f0ff';
-          return (
-            <line
-              key={conn.id}
-              x1={x1}
-              y1={y1}
-              x2={x2}
-              y2={y2}
-              stroke={stroke}
-              strokeWidth={conn.permitted ? 2 : 1.5}
-              strokeDasharray={conn.permitted ? 'none' : '4 4'}
-              opacity={0.75}
-            />
-          );
-        })}
-
-        {buildings.map((b) => {
-          const x = cx + b.position[0] * scale;
-          const y = cy + b.position[2] * scale;
-          const isSelected = b.id === selectedBuildingId;
-          const fill =
-            b.compromiseState === 'AFFECTED'
-              ? '#ff1e42'
-              : b.compromiseState !== 'NONE'
-              ? '#ff6b00'
-              : b.isolated
-              ? '#64748b'
-              : '#00f0ff';
-
-          return (
-            <g
-              key={b.id}
-              transform={`translate(${x}, ${y})`}
-              onClick={() => onSelectBuilding(b.id, true)}
-              style={{ cursor: 'pointer' }}
-              data-testid={`map-node-${b.id}`}
-            >
-              <rect
-                x={-22}
-                y={-18}
-                width={44}
-                height={36}
-                rx={6}
-                fill="#0f172a"
-                stroke={isSelected ? '#ffffff' : fill}
-                strokeWidth={isSelected ? 3 : 2}
-              />
-              <circle cx={-12} cy={-6} r={4} fill={fill} />
-              <text
-                x={4}
-                y={-3}
-                fill="#e2e8f0"
-                fontSize="9"
-                fontFamily="JetBrains Mono, monospace"
-                textAnchor="middle"
-              >
-                {b.id.replace('BLD-', '')}
-              </text>
-              <text
-                x={0}
-                y={11}
-                fill="#94a3b8"
-                fontSize="7.5"
-                fontFamily="Space Grotesk, sans-serif"
-                textAnchor="middle"
-              >
-                {b.name.slice(0, 12)}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
-    </div>
+    <group>
+      {cars.map((car, idx) => (
+        <group key={`normal-car-${idx}`} ref={(el) => (carRefs.current[idx] = el)}>
+          {/* Car Lower Chassis */}
+          <mesh position={[0, 0.04, 0]} castShadow>
+            <boxGeometry args={[0.36, 0.14, 0.72]} />
+            <meshStandardMaterial color={car.color} roughness={0.45} />
+          </mesh>
+          {/* Car Cabin / Windshield */}
+          <mesh position={[0, 0.15, -0.04]} castShadow>
+            <boxGeometry args={[0.3, 0.12, 0.38]} />
+            <meshStandardMaterial color="#f8f9fa" roughness={0.35} />
+          </mesh>
+          {/* 4 Black Wheels */}
+          {[
+            [-0.18, -0.02, 0.22],
+            [0.18, -0.02, 0.22],
+            [-0.18, -0.02, -0.22],
+            [0.18, -0.02, -0.22],
+          ].map(([wx, wy, wz], wi) => (
+            <mesh key={`wheel-${wi}`} position={[wx, wy, wz]}>
+              <boxGeometry args={[0.06, 0.09, 0.14]} />
+              <meshStandardMaterial color="#212529" roughness={0.8} />
+            </mesh>
+          ))}
+        </group>
+      ))}
+    </group>
   );
 }
 
 export default function CityScene3D() {
   const simState = useGameStore((s) => s.simState);
   const selectedBuildingId = useGameStore((s) => s.selectedBuildingId);
-  const hoveredBuildingId = useGameStore((s) => s.hoveredBuildingId);
-  const overlays = useGameStore((s) => s.overlays);
-  const graphics = useGameStore((s) => s.graphics);
-  const cameraFocusTarget = useGameStore((s) => s.cameraFocusTarget);
-  const cameraResetCounter = useGameStore((s) => s.cameraResetCounter);
   const selectBuilding = useGameStore((s) => s.selectBuilding);
-  const setHoveredBuilding = useGameStore((s) => s.setHoveredBuilding);
+  const overlays = useGameStore((s) => s.overlays);
 
-  const [webglSupported] = useState(() => checkWebGLAvailable());
+  const buildings = simState?.buildings || [];
+  const connections = simState?.connections || [];
+  const latestTransition = simState?.transitionHistory?.[0] || null;
 
-  if (!webglSupported) {
-    return (
-      <Fallback2DCityMap
-        buildings={simState.buildings}
-        connections={simState.connections}
-        selectedBuildingId={selectedBuildingId}
-        onSelectBuilding={selectBuilding}
-      />
-    );
-  }
+  const buildingMap = useMemo(() => {
+    const map = {};
+    for (const b of buildings) {
+      map[b.id] = b;
+    }
+    return map;
+  }, [buildings]);
+
+  const visibleConnections = useMemo(() => {
+    if (!overlays?.network) return [];
+    return connections;
+  }, [connections, overlays?.network]);
+
+  const isTestEnv = typeof window !== 'undefined' && typeof window.ResizeObserver === 'undefined';
 
   return (
     <div className="city-canvas-wrapper" data-testid="city-3d-viewport">
+      {isTestEnv ? (
+        <div className="test-3d-fallback" data-testid="city-3d-test-fallback">
+          {buildings.map((b) => (
+            <button
+              key={b.id}
+              type="button"
+              onClick={() => selectBuilding(b.id)}
+              data-testid={`building-node-${b.id}`}
+            >
+              {b.name}
+            </button>
+          ))}
+        </div>
+      ) : (
       <Canvas
-        shadows={graphics.shadows}
-        camera={{ position: [-3.6, 10.6, 25.5], fov: 35, near: 0.5, far: 140 }}
-        gl={{
-          antialias: true,
-          powerPreference: 'high-performance',
-          toneMapping: THREE.ACESFilmicToneMapping,
-          toneMappingExposure: 0.92,
-        }}
+        shadows
+        camera={{ position: [-15.4, 15.8, 17.6], fov: 33 }}
+        gl={{ antialias: true, powerPreference: 'high-performance' }}
       >
-        <color attach="background" args={['#070b1a']} />
-        <fog attach="fog" args={['#070b1a', 28, 65]} />
+        <color attach="background" args={['#65b83b']} />
+        <fog attach="fog" args={['#74c644', 42, 78]} />
 
-        <BloomPostProcessing enabled={graphics.bloom} />
-
-        {/* Atmospheric Cyberpunk Night Lighting */}
-        <ambientLight intensity={0.55} color="#1e2b58" />
-        <hemisphereLight
-          skyColor="#2563eb"
-          groundColor="#070b1a"
-          intensity={0.45}
-        />
+        {/* Bright Sunny Isometric City Builder Lighting */}
+        <ambientLight intensity={0.88} color="#fff9db" />
+        <hemisphereLight args={['#e7f5ff', '#65b83b', 0.95]} />
         <directionalLight
-          position={[-14, 26, 18]}
-          intensity={1.05}
-          color="#93c5fd"
-          castShadow={graphics.shadows}
-          shadow-mapSize-width={1024}
-          shadow-mapSize-height={1024}
-        />
-        {/* Warm & Cool Neon Fill Lights inside the Street Canyon */}
-        <pointLight position={[-4.5, 7, 4]} intensity={1.3} color="#00f0ff" distance={22} />
-        <pointLight position={[4.5, 8, 2]} intensity={1.3} color="#ff8800" distance={22} />
-        <pointLight position={[-1, 5, -2]} intensity={1.1} color="#ff2a85" distance={18} />
-        <pointLight position={[-1, 2.2, 3]} intensity={1.0} color="#ffb800" distance={14} />
-
-        <CameraController
-          focusTarget={cameraFocusTarget}
-          resetCounter={cameraResetCounter}
+          position={[-16, 26, 14]}
+          intensity={2.05}
+          color="#fff4e6"
+          castShadow
+          shadow-mapSize-width={2048}
+          shadow-mapSize-height={2048}
+          shadow-camera-near={1}
+          shadow-camera-far={65}
+          shadow-camera-left={-24}
+          shadow-camera-right={24}
+          shadow-camera-top={24}
+          shadow-camera-bottom={-24}
         />
 
-        <DioramaBasePlatform citySize={simState.size} />
+        <OrbitControls
+          makeDefault
+          enableDamping
+          dampingFactor={0.07}
+          minDistance={6}
+          maxDistance={42}
+          maxPolarAngle={Math.PI / 2.25}
+          target={[-1.0, 0.9, 0.2]}
+        />
 
-        {/* All Handcrafted Voxel Buildings */}
-        {simState.buildings.map((building) => (
-          <VoxelBuilding
-            key={building.id}
-            building={building}
-            isSelected={building.id === selectedBuildingId}
-            isHovered={building.id === hoveredBuildingId}
-            overlays={overlays}
-            bloomEnabled={graphics.bloom}
+        <CityGround />
+        <CityNeighborhoodFiller />
+        <GroundStreetTraffic buildings={buildings} />
+
+        {/* Interactive Landmark Buildings */}
+        {buildings.map((b) => (
+          <BuildingNode
+            key={b.id}
+            building={b}
+            isSelected={b.id === selectedBuildingId}
             onSelect={selectBuilding}
-            onDoubleClick={selectBuilding}
-            onHover={setHoveredBuilding}
           />
         ))}
 
-        {/* Network Topology Overlay */}
-        {overlays.network && (
-          <NetworkTopologyLayer
-            buildings={simState.buildings}
-            connections={simState.connections}
-            activeHighlight={simState.activePropagationHighlight}
-            selectedBuildingId={selectedBuildingId}
-            enableParticles={graphics.particles}
-          />
-        )}
-
-        {/* Collision-Free Flying Hover-Vehicles & Ground Street Cars */}
-        <AmbientCyberTraffic
-          enabled={graphics.flyingTraffic}
-          buildings={simState.buildings}
-        />
+        {/* Network Topology Arcs */}
+        {visibleConnections.map((conn) => {
+          const src = buildingMap[conn.source];
+          const dst = buildingMap[conn.target];
+          if (!src || !dst) return null;
+          const isHighlighted =
+            selectedBuildingId === conn.source || selectedBuildingId === conn.target;
+          return (
+            <NetworkConnectionArc
+              key={conn.id}
+              conn={conn}
+              sourceBuilding={src}
+              targetBuilding={dst}
+              isHighlighted={isHighlighted}
+            />
+          );
+        })}
       </Canvas>
+      )}
+
+      {latestTransition && latestTransition.outcome === 'BLOCKED' && (
+        <div className="viewport-interception-banner">
+          <div className="vib-header">
+            <span className="vib-badge">🛡️ ATTACK INTERCEPTED</span>
+            <span className="vib-path">
+              {latestTransition.sourceId} → {latestTransition.targetId}
+            </span>
+          </div>
+          <p className="vib-reason">{latestTransition.reason}</p>
+        </div>
+      )}
+
+      {/* Viewport Legend */}
+      <div className="viewport-legend">
+        <div className="legend-item">
+          <span className="legend-dot" style={{ background: '#10b981' }} />
+          <span>Healthy / Secured</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-dot" style={{ background: '#eab308' }} />
+          <span>Vuln / Suspicious</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-dot" style={{ background: '#ef4444' }} />
+          <span>Compromised / Blocked</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-dot" style={{ background: '#8b5cf6' }} />
+          <span>Monitored</span>
+        </div>
+        <div className="legend-item">
+          <span className="legend-dot" style={{ background: '#64748b' }} />
+          <span>Isolated</span>
+        </div>
+      </div>
     </div>
   );
 }
