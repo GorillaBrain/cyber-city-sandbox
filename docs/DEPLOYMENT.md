@@ -2,6 +2,8 @@
 
 **Cyber City Sandbox** is a static Single-Page Application (SPA) built with Vite and React, pre-configured for zero-configuration deployment on **Vercel** (Hobby plan).
 
+- **Live Production URL:** [https://cyber-city-sandbox.vercel.app](https://cyber-city-sandbox.vercel.app)
+
 ## 1. Local Production Build & Preview
 
 ```bash

@@ -3,6 +3,8 @@
 > **A living city. A connected network. Your security, your rules.**
 > An interactive 3D cyberpunk voxel city, network topology simulator, and defensive cybersecurity strategy game.
 
+**🚀 Live Demo (Vercel):** [https://cyber-city-sandbox.vercel.app](https://cyber-city-sandbox.vercel.app)
+
 ![Cyber City Sandbox Live Application](docs/assets/screenshot-main.png)
 
 ---
